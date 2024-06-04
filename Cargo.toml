@@ -20,7 +20,7 @@ path = "src/client/main.rs"
 [dependencies]
 anyhow = "1.0.86"
 clap = { version = "4.5.4", features = ["derive"] }
-cpal = "0.15.3"
+cpal = { version = "0.15.3", features = ["oboe-shared-stdcxx"] }
 dirs = "5.0.1"
 ringbuf = "0.4.1"
 rodio = "0.18"
