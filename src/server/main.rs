@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     env,
     net::SocketAddr,
     sync::mpsc::{self, Receiver},
@@ -43,7 +44,7 @@ async fn payload_server(
                 continue;
             }
         };
-        println!("Sending to {:?} payload {:?}", socket.local_addr(), config);
+        println!("Sending to {:?} payload {:?}", socket.peer_addr(), config);
         let value = serde_json::to_string(&SupportedStreamConfigSerialize(&config))?;
         socket.write(value.as_bytes()).await?;
     }
@@ -59,7 +60,8 @@ async fn stream_server(
     println!("Starting Stream Server");
     let sock = UdpSocket::bind(server_addr).await?;
     println!("Stream server listening on: {}", sock.local_addr()?);
-    let mut buffer = [0; 123];
+    let mut buffer = [0; 8];
+    let mut interested = HashSet::new();
     loop {
         if let Ok(changed) = close_rx.has_changed() {
             if changed && *close_rx.borrow_and_update() {
@@ -77,12 +79,19 @@ async fn stream_server(
             yield_now().await;
         };
 
-        if let Ok((_, source)) = sock.try_recv_from(&mut buffer) {
-            let _ = sock.send_to(&sample.data, source).await?;
-            // println!("{:?} bytes sent", len);
-        } else {
-            yield_now().await;
+        if let Ok((len, source)) = sock.try_recv_from(&mut buffer) {
+            let msg = unsafe { std::str::from_utf8_unchecked(&buffer[..len]) };
+            if msg == "START" {
+                interested.insert(source);
+            }
         }
+
+        for source in &interested {
+            let len = sock.send_to(&sample.data, source).await?;
+            println!("{:?} bytes sent to {}", len, source);
+        }
+
+        yield_now().await;
     }
     println!("Stopping Stream Server");
     Ok(())
@@ -92,8 +101,10 @@ async fn stream_server(
 async fn main() -> Result<()> {
     let server_addr: SocketAddr = env::args()
         .nth(1)
-        .unwrap_or_else(|| "127.0.0.1:48182".into())
+        .unwrap_or_else(|| "0.0.0.0:48182".into())
         .parse()?;
+
+    println!("{} {}", server_addr.ip(), server_addr.port());
 
     let host = cpal::default_host();
 
@@ -211,22 +222,28 @@ async fn main() -> Result<()> {
         Ok(())
     });
 
-    let mut ctrl_c_signal = signal::windows::ctrl_c()?;
-    let mut ctrl_close_signal = signal::windows::ctrl_close()?;
-    let mut ctrl_break_signal = signal::windows::ctrl_break()?;
-    let mut ctrl_logoff_signal = signal::windows::ctrl_logoff()?;
-    let mut ctrl_shutdown_signal = signal::windows::ctrl_shutdown()?;
-
     let stream_joinh = tokio::spawn(stream_server(server_addr, data_send_rx, close_rx.clone()));
     let payload_joinh = tokio::spawn(payload_server(server_addr, config, close_rx.clone()));
 
-    tokio::select! {
-        _ = ctrl_c_signal.recv() => { },
-        _ = ctrl_close_signal.recv() => { },
-        _ = ctrl_break_signal.recv() => { },
-        _ = ctrl_logoff_signal.recv() => { },
-        _ = ctrl_shutdown_signal.recv() => { },
-    };
+    #[cfg(not(target_os = "windows"))]
+    {
+        signal::ctrl_c().await?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let mut ctrl_c_signal = signal::windows::ctrl_c()?;
+        let mut ctrl_close_signal = signal::windows::ctrl_close()?;
+        let mut ctrl_break_signal = signal::windows::ctrl_break()?;
+        let mut ctrl_logoff_signal = signal::windows::ctrl_logoff()?;
+        let mut ctrl_shutdown_signal = signal::windows::ctrl_shutdown()?;
+        tokio::select! {
+            _ = ctrl_c_signal.recv() => { },
+            _ = ctrl_close_signal.recv() => { },
+            _ = ctrl_break_signal.recv() => { },
+            _ = ctrl_logoff_signal.recv() => { },
+            _ = ctrl_shutdown_signal.recv() => { },
+        };
+    }
 
     close_tx.send(true)?;
     if let Err(e) = stream_joinh.await? {
