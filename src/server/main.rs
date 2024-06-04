@@ -2,6 +2,7 @@ use std::{
     collections::HashSet,
     env,
     net::SocketAddr,
+    num::{NonZeroU32, NonZeroU8},
     sync::mpsc::{self, Receiver},
 };
 
@@ -18,10 +19,7 @@ use tokio::{
     sync::watch,
     task::yield_now,
 };
-
-struct SampleData {
-    data: Vec<u8>,
-}
+use vorbis_rs::VorbisEncoderBuilder;
 
 async fn payload_server(
     server_addr: SocketAddr,
@@ -59,7 +57,7 @@ async fn payload_server(
 
 async fn stream_server(
     server_addr: SocketAddr,
-    data_send_rx: Receiver<SampleData>,
+    data_send_rx: Receiver<Vec<u8>>,
     mut close_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     println!("Starting Stream Server");
@@ -74,7 +72,7 @@ async fn stream_server(
             }
         }
 
-        let sample = loop {
+        let samples = loop {
             let result = data_send_rx.recv();
             if let Ok(data) = result {
                 break data;
@@ -92,8 +90,8 @@ async fn stream_server(
         }
 
         for source in &interested {
-            let len = sock.send_to(&sample.data, source).await?;
-            println!("{:?} bytes sent to {}", len, source);
+            let _len = sock.send_to(&samples, source).await?;
+            // println!("{:?} bytes sent to {}", len, source);
         }
 
         yield_now().await;
@@ -143,7 +141,7 @@ async fn main() -> Result<()> {
 
     let (close_tx, close_rx) = watch::channel(false);
     let (stream_close_tx, stream_close_rx) = mpsc::channel();
-    let (data_send_tx, data_send_rx) = mpsc::channel::<SampleData>();
+    let (data_send_tx, data_send_rx) = mpsc::channel();
 
     println!("Sample Format {:?}", config.sample_format());
 
@@ -154,54 +152,74 @@ async fn main() -> Result<()> {
     let config_clone = config.clone();
     let stream_thread = std::thread::spawn(move || -> Result<()> {
         let stream = match config_clone.sample_format() {
-            SampleFormat::I8 => device.build_input_stream(
-                &config_clone.into(),
-                move |data: &[i8], _: &_| {
-                    let _ = data_send_tx.send(SampleData {
-                        data: data
-                            .into_iter()
-                            .flat_map(|v| v.to_be_bytes())
-                            .collect::<Vec<u8>>(),
-                    });
-                },
-                err_fn,
-                None,
-            )?,
-            SampleFormat::I16 => device.build_input_stream(
-                &config_clone.into(),
-                move |data: &[i16], _: &_| {
-                    let _ = data_send_tx.send(SampleData {
-                        data: data
-                            .into_iter()
-                            .flat_map(|v| v.to_be_bytes())
-                            .collect::<Vec<u8>>(),
-                    });
-                },
-                err_fn,
-                None,
-            )?,
-            SampleFormat::I32 => device.build_input_stream(
-                &config_clone.into(),
-                move |data: &[i32], _: &_| {
-                    let _ = data_send_tx.send(SampleData {
-                        data: data
-                            .into_iter()
-                            .flat_map(|v| v.to_be_bytes())
-                            .collect::<Vec<u8>>(),
-                    });
-                },
-                err_fn,
-                None,
-            )?,
+            // SampleFormat::I8 => device.build_input_stream(
+            //     &config_clone.into(),
+            //     move |data: &[i8], _: &_| {
+            //         let _ = data_send_tx.send(SampleData {
+            //             data: data
+            //                 .into_iter()
+            //                 .flat_map(|v| v.to_be_bytes())
+            //                 .collect::<Vec<u8>>(),
+            //         });
+            //     },
+            //     err_fn,
+            //     None,
+            // )?,
+            // SampleFormat::I16 => device.build_input_stream(
+            //     &config_clone.into(),
+            //     move |data: &[i16], _: &_| {
+            //         let _ = data_send_tx.send(SampleData {
+            //             data: data
+            //                 .into_iter()
+            //                 .flat_map(|v| v.to_be_bytes())
+            //                 .collect::<Vec<u8>>(),
+            //         });
+            //     },
+            //     err_fn,
+            //     None,
+            // )?,
+            // SampleFormat::I32 => device.build_input_stream(
+            //     &config_clone.into(),
+            //     move |data: &[i32], _: &_| {
+            //         let _ = data_send_tx.send(SampleData {
+            //             data: data
+            //                 .into_iter()
+            //                 .flat_map(|v| v.to_be_bytes())
+            //                 .collect::<Vec<u8>>(),
+            //         });
+            //     },
+            //     err_fn,
+            //     None,
+            // )?,
             SampleFormat::F32 => device.build_input_stream(
                 &config_clone.into(),
-                move |data: &[f32], _: &_| {
-                    let _ = data_send_tx.send(SampleData {
-                        data: data
-                            .into_iter()
-                            .flat_map(|v| v.to_be_bytes())
-                            .collect::<Vec<u8>>(),
-                    });
+                move |data: &[f32], _| {
+                    let mut encoded_data: Vec<u8> = Vec::new();
+                    let sampling_frequency = NonZeroU32::new(48000).ok_or(anyhow!("WUT")).unwrap();
+                    let channels = NonZeroU8::new(1).ok_or(anyhow!("WUT")).unwrap();
+                    {
+                        let mut encoder = VorbisEncoderBuilder::new(
+                            sampling_frequency,
+                            channels,
+                            &mut encoded_data,
+                        )
+                        .unwrap()
+                        .build()
+                        .unwrap();
+                        let encode_result = encoder.encode_audio_block([data]);
+                        match encode_result {
+                            Ok(_) => {
+                                eprintln!("Encode OK");
+                            }
+                            Err(e) => {
+                                eprintln!("SHIT {e:?}");
+                            }
+                        }
+                    }
+                    println!("{} vs {}", data.len(), encoded_data.len());
+                    let mut samples = Vec::new();
+                    samples.extend_from_slice(&data);
+                    let _ = data_send_tx.send(encoded_data);
                 },
                 err_fn,
                 None,

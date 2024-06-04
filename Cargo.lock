@@ -103,6 +103,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b3d1d046238990b9cf5bcde22a3fb3584ee5cf65fb2765f454ed428c7a0063da"
 
 [[package]]
+name = "aotuv_lancer_vorbis_sys"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "495ea2c3cc8dc08e9fb6ff470c9c90e44d4fbc648882a0bfaba13216daea4c3c"
+dependencies = [
+ "cc",
+ "ogg_next_sys",
+]
+
+[[package]]
 name = "arrayvec"
 version = "0.7.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -392,6 +402,16 @@ name = "equivalent"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5443807d6dff69373d433ab9ef5378ad8df50ca6298caf15de6e52e24aaf54d5"
+
+[[package]]
+name = "errno"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "534c5cf6194dfab3db3242765c03bbe257cf92f22b38f6bc0c58d59108a820ba"
+dependencies = [
+ "libc",
+ "windows-sys 0.52.0",
+]
 
 [[package]]
 name = "getrandom"
@@ -720,6 +740,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "vorbis_rs",
 ]
 
 [[package]]
@@ -761,6 +782,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6951b4e8bf21c8193da321bcce9c9dd2e13c858fe078bf9054a288b419ae5d6e"
 dependencies = [
  "byteorder",
+]
+
+[[package]]
+name = "ogg_next_sys"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac4af25868786f6ab24956a8496a1eca4b010f860b449596f523d19ee9f956ae"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
@@ -1163,6 +1193,20 @@ name = "utf8parse"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "711b9620af191e0cdc7468a8d14e709c3dcdb115b36f838e601583af800a370a"
+
+[[package]]
+name = "vorbis_rs"
+version = "0.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "513beb7a94438399e404b297592dad39e99dd5e39515ab66dfe9caa6fd18897a"
+dependencies = [
+ "aotuv_lancer_vorbis_sys",
+ "errno",
+ "getrandom",
+ "ogg_next_sys",
+ "thiserror",
+ "tinyvec",
+]
 
 [[package]]
 name = "walkdir"

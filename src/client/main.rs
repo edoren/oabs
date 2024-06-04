@@ -17,6 +17,7 @@ use tokio::{
     signal,
     sync::watch,
 };
+use vorbis_rs::VorbisDecoder;
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Client", long_about = None)]
@@ -146,15 +147,14 @@ async fn main() -> Result<()> {
 
             match recv_result {
                 Ok(len) => {
-                    let iter = buf[..len]
-                        .chunks_exact(4)
-                        .map(TryInto::try_into)
-                        .map(Result::unwrap)
-                        .map(f32::from_be_bytes);
-                    let data_count = len / 4;
-                    let written_count = producer.push_iter(iter);
-                    if written_count < data_count {
-                        eprintln!("output stream fell behind: try increasing latency");
+                    let mut decoder: VorbisDecoder<&[u8]> = VorbisDecoder::new(&buf[..len])?;
+                    while let Some(decoded_block) = decoder.decode_audio_block()? {
+                        let channel1 = decoded_block.samples()[0];
+                        let data_count = channel1.len();
+                        let written_count = producer.push_slice(channel1);
+                        if written_count < data_count {
+                            eprintln!("output stream fell behind: try increasing latency");
+                        }
                     }
                 }
                 Err(e) => return Err::<(), anyhow::Error>(anyhow!("{e}")),
