@@ -274,22 +274,28 @@ async fn main() -> Result<()> {
 
     println!("{config:?}");
 
-    let mut ctrl_c_signal = signal::windows::ctrl_c()?;
-    let mut ctrl_close_signal = signal::windows::ctrl_close()?;
-    let mut ctrl_break_signal = signal::windows::ctrl_break()?;
-    let mut ctrl_logoff_signal = signal::windows::ctrl_logoff()?;
-    let mut ctrl_shutdown_signal = signal::windows::ctrl_shutdown()?;
-
     let stream_receiver_joinh = tokio::spawn(stream_receiver_task);
     let player_joinh = std::thread::spawn(player_task);
 
-    tokio::select! {
-        _ = ctrl_c_signal.recv() => { },
-        _ = ctrl_close_signal.recv() => { },
-        _ = ctrl_break_signal.recv() => { },
-        _ = ctrl_logoff_signal.recv() => { },
-        _ = ctrl_shutdown_signal.recv() => { },
-    };
+    #[cfg(not(target_os = "windows"))]
+    {
+        signal::ctrl_c().await?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let mut ctrl_c_signal = signal::windows::ctrl_c()?;
+        let mut ctrl_close_signal = signal::windows::ctrl_close()?;
+        let mut ctrl_break_signal = signal::windows::ctrl_break()?;
+        let mut ctrl_logoff_signal = signal::windows::ctrl_logoff()?;
+        let mut ctrl_shutdown_signal = signal::windows::ctrl_shutdown()?;
+        tokio::select! {
+            _ = ctrl_c_signal.recv() => { },
+            _ = ctrl_close_signal.recv() => { },
+            _ = ctrl_break_signal.recv() => { },
+            _ = ctrl_logoff_signal.recv() => { },
+            _ = ctrl_shutdown_signal.recv() => { },
+        };
+    }
 
     close_tx.send(true)?;
     if let Err(e) = stream_receiver_joinh.await? {
