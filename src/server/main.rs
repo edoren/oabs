@@ -31,6 +31,7 @@ async fn payload_server(
     println!("Starting Payload Server");
     let listener = TcpListener::bind(server_addr).await?;
     println!("Payload server listening on: {}", listener.local_addr()?);
+    let mut sockets = Vec::new();
     loop {
         let mut socket;
         tokio::select! {
@@ -47,6 +48,10 @@ async fn payload_server(
         println!("Sending to {:?} payload {:?}", socket.peer_addr(), config);
         let value = serde_json::to_string(&SupportedStreamConfigSerialize(&config))?;
         socket.write(value.as_bytes()).await?;
+        sockets.push(socket);
+    }
+    for mut socket in sockets {
+        let _ = socket.write_i32(-1).await;
     }
     println!("Stopping Payload Server");
     Ok(())

@@ -12,6 +12,7 @@ use ringbuf::{
     HeapRb,
 };
 use tokio::{
+    io::AsyncReadExt,
     net::{TcpStream, UdpSocket},
     signal,
     sync::watch,
@@ -44,7 +45,7 @@ async fn main() -> Result<()> {
     let remote_addr: SocketAddr = opt.server.parse()?;
 
     println!("Connecting to server {}", opt.server);
-    let stream = TcpStream::connect(remote_addr).await?;
+    let mut stream = TcpStream::connect(remote_addr).await?;
 
     // Wait for the socket to be readable
     stream.readable().await?;
@@ -145,18 +146,14 @@ async fn main() -> Result<()> {
 
             match recv_result {
                 Ok(len) => {
-                    let mut output_fell_behind = false;
-                    for sample in buf[..len]
+                    let iter = buf[..len]
                         .chunks_exact(4)
                         .map(TryInto::try_into)
                         .map(Result::unwrap)
-                        .map(f32::from_be_bytes)
-                    {
-                        if producer.try_push(sample).is_err() {
-                            output_fell_behind = true;
-                        }
-                    }
-                    if output_fell_behind {
+                        .map(f32::from_be_bytes);
+                    let data_count = len / 4;
+                    let written_count = producer.push_iter(iter);
+                    if written_count < data_count {
                         eprintln!("output stream fell behind: try increasing latency");
                     }
                 }
@@ -234,17 +231,9 @@ async fn main() -> Result<()> {
             SampleFormat::F32 => device.build_output_stream(
                 &config_clone.into(),
                 move |data: &mut [f32], _: &_| {
-                    let mut input_fell_behind = false;
-                    for sample in data {
-                        *sample = match consumer.try_pop() {
-                            Some(s) => s,
-                            None => {
-                                input_fell_behind = true;
-                                0.0
-                            }
-                        };
-                    }
-                    if input_fell_behind {
+                    let received_count = data.len();
+                    let read_count = consumer.pop_slice(data);
+                    if read_count < received_count {
                         eprintln!("input stream fell behind: try increasing latency");
                     }
                 },
@@ -294,6 +283,13 @@ async fn main() -> Result<()> {
             _ = ctrl_break_signal.recv() => { },
             _ = ctrl_logoff_signal.recv() => { },
             _ = ctrl_shutdown_signal.recv() => { },
+            result = stream.read_i32() => {
+                if let Ok(result) = result {
+                    if result == -1 {
+                        println!("Server closed");
+                    }
+                }
+             }
         };
     }
 
