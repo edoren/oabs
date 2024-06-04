@@ -43,6 +43,7 @@ async fn main() -> Result<()> {
 
     let remote_addr: SocketAddr = opt.server.parse()?;
 
+    println!("Connecting to server {}", opt.server);
     let stream = TcpStream::connect(remote_addr).await?;
 
     // Wait for the socket to be readable
@@ -67,10 +68,8 @@ async fn main() -> Result<()> {
         }
     };
 
-    let opt_latency = 150.0;
-
     // Create a delay in case the input and output devices aren't synced.
-    let latency_frames = (opt_latency / 1_000.0) * config.sample_rate().0 as f32;
+    let latency_frames = (opt.latency / 1_000.0) * config.sample_rate().0 as f32;
     let latency_samples = latency_frames as usize * config.channels() as usize;
 
     let buffer_size = latency_samples * 2 * 4;
@@ -125,44 +124,43 @@ async fn main() -> Result<()> {
             "[::]:0".parse()?
         };
         let cli = UdpSocket::bind(local_addr).await?;
-        let mut buf = [0; 5120];
         cli.connect(remote_addr).await?;
+        let mut buf = [0; 5120];
+
+        cli.send("START".as_bytes()).await?;
+
         loop {
-            let res = cli.send(&[1]).await;
-
-            if let Ok(_) = res {
-                let recv_result;
-                tokio::select! {
-                    result = cli.recv(&mut buf) => {
-                        recv_result = result;
-                    },
-                    result = close_rx_stream_receiver_task.changed() => {
-                        if result.is_ok() && *close_rx_stream_receiver_task.borrow_and_update() {
-                            break;
-                        }
-                        continue;
+            let recv_result;
+            tokio::select! {
+                result = cli.recv(&mut buf) => {
+                    recv_result = result;
+                },
+                result = close_rx_stream_receiver_task.changed() => {
+                    if result.is_ok() && *close_rx_stream_receiver_task.borrow_and_update() {
+                        break;
                     }
-                };
-
-                match recv_result {
-                    Ok(len) => {
-                        let mut output_fell_behind = false;
-                        for sample in buf[..len]
-                            .chunks_exact(4)
-                            .map(TryInto::try_into)
-                            .map(Result::unwrap)
-                            .map(f32::from_be_bytes)
-                        {
-                            if producer.try_push(sample).is_err() {
-                                output_fell_behind = true;
-                            }
-                        }
-                        if output_fell_behind {
-                            eprintln!("output stream fell behind: try increasing latency");
-                        }
-                    }
-                    Err(e) => return Err::<(), anyhow::Error>(anyhow!("{e}")),
+                    continue;
                 }
+            };
+
+            match recv_result {
+                Ok(len) => {
+                    let mut output_fell_behind = false;
+                    for sample in buf[..len]
+                        .chunks_exact(4)
+                        .map(TryInto::try_into)
+                        .map(Result::unwrap)
+                        .map(f32::from_be_bytes)
+                    {
+                        if producer.try_push(sample).is_err() {
+                            output_fell_behind = true;
+                        }
+                    }
+                    if output_fell_behind {
+                        eprintln!("output stream fell behind: try increasing latency");
+                    }
+                }
+                Err(e) => return Err::<(), anyhow::Error>(anyhow!("{e}")),
             }
         }
         Ok(())
