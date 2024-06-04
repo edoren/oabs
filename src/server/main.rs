@@ -207,16 +207,10 @@ async fn main() -> Result<()> {
                         .build()
                         .unwrap();
                         let encode_result = encoder.encode_audio_block([data]);
-                        match encode_result {
-                            Ok(_) => {
-                                eprintln!("Encode OK");
-                            }
-                            Err(e) => {
-                                eprintln!("SHIT {e:?}");
-                            }
+                        if let Err(err) = encode_result {
+                            eprintln!("Encoding Error: {err:?}")
                         }
                     }
-                    println!("{} vs {}", data.len(), encoded_data.len());
                     let mut samples = Vec::new();
                     samples.extend_from_slice(&data);
                     let _ = data_send_tx.send(encoded_data);
