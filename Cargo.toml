@@ -21,10 +21,14 @@ path = "src/client/main.rs"
 anyhow = "1.0.86"
 clap = { version = "4.5.4", features = ["derive"] }
 cpal = { version = "0.15.3", features = ["oboe-shared-stdcxx"] }
+dialoguer = { version = "0.11.0", features = ["fuzzy-select"] }
 dirs = "5.0.1"
+log = "0.4.21"
 ringbuf = "0.4.1"
 rodio = "0.18"
 serde = { version = "1.0.203", features = ["derive"] }
 serde_json = "1.0.117"
 tokio = { version = "1.37.0", features = ["full"] }
+tracing-appender = "0.2.3"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 vorbis_rs = "0.5.4"

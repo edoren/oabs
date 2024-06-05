@@ -1,16 +1,18 @@
 use std::{
     collections::HashSet,
-    env,
     net::SocketAddr,
     num::{NonZeroU32, NonZeroU8},
     sync::mpsc::{self, Receiver},
 };
 
 use anyhow::{anyhow, Result};
+use clap::Parser;
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
-    Device, SampleFormat, SupportedStreamConfig,
+    Device, SampleFormat, SampleRate, SupportedStreamConfig,
 };
+use dialoguer::{theme::ColorfulTheme, FuzzySelect};
+use log::{debug, error};
 use oabs_lib::SupportedStreamConfigSerialize;
 use tokio::{
     io::AsyncWriteExt,
@@ -19,16 +21,36 @@ use tokio::{
     sync::watch,
     task::yield_now,
 };
+use tracing_appender::rolling::{RollingFileAppender, Rotation};
+use tracing_subscriber::{
+    filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
+};
 use vorbis_rs::VorbisEncoderBuilder;
+
+#[derive(Parser, Debug)]
+#[command(version, about = "Server", long_about = None)]
+struct Opt {
+    /// The port name to use
+    #[arg(short, long, value_name = "PORT", default_value_t = 48182)]
+    port: u16,
+
+    /// Specify the delay between input and output
+    #[arg(short, long, value_name = "DELAY_MS", default_value_t = 150.0)]
+    latency: f32,
+
+    /// Specify the delay between input and output
+    #[arg(short, long, value_name = "VERBOSE", default_value_t = false)]
+    verbose: bool,
+}
 
 async fn payload_server(
     server_addr: SocketAddr,
     config: SupportedStreamConfig,
     mut close_rx: watch::Receiver<bool>,
 ) -> Result<()> {
-    println!("Starting Payload Server");
+    debug!("Starting Payload Server");
     let listener = TcpListener::bind(server_addr).await?;
-    println!("Payload server listening on: {}", listener.local_addr()?);
+    debug!("Payload server listening on: {}", listener.local_addr()?);
     let mut sockets = Vec::new();
     loop {
         let mut socket;
@@ -43,7 +65,7 @@ async fn payload_server(
                 continue;
             }
         };
-        println!("Sending to {:?} payload {:?}", socket.peer_addr(), config);
+        debug!("Sending to {:?} payload {:?}", socket.peer_addr(), config);
         let value = serde_json::to_string(&SupportedStreamConfigSerialize(&config))?;
         socket.write(value.as_bytes()).await?;
         sockets.push(socket);
@@ -51,7 +73,7 @@ async fn payload_server(
     for mut socket in sockets {
         let _ = socket.write_i32(-1).await;
     }
-    println!("Stopping Payload Server");
+    debug!("Stopping Payload Server");
     Ok(())
 }
 
@@ -60,9 +82,9 @@ async fn stream_server(
     data_send_rx: Receiver<Vec<u8>>,
     mut close_rx: watch::Receiver<bool>,
 ) -> Result<()> {
-    println!("Starting Stream Server");
+    debug!("Starting Stream Server");
     let sock = UdpSocket::bind(server_addr).await?;
-    println!("Stream server listening on: {}", sock.local_addr()?);
+    debug!("Stream server listening on: {}", sock.local_addr()?);
     let mut buffer = [0; 8];
     let mut interested = HashSet::new();
     loop {
@@ -91,51 +113,93 @@ async fn stream_server(
 
         for source in &interested {
             let _len = sock.send_to(&samples, source).await?;
-            // println!("{:?} bytes sent to {}", len, source);
+            // debug!("{:?} bytes sent to {}", len, source);
         }
 
         yield_now().await;
     }
-    println!("Stopping Stream Server");
+    debug!("Stopping Stream Server");
     Ok(())
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let server_addr: SocketAddr = env::args()
-        .nth(1)
-        .unwrap_or_else(|| "0.0.0.0:48182".into())
-        .parse()?;
+    let opt = Opt::parse();
 
-    println!("{} {}", server_addr.ip(), server_addr.port());
+    let app_config_dir = dirs::config_dir()
+        .ok_or(anyhow!("Could not get config dir"))?
+        .join("oabs_server");
+
+    // Logging
+
+    let logs_dir = app_config_dir.join("logs");
+    let default_filter = |filter: LevelFilter| {
+        EnvFilter::builder()
+            .with_default_directive(filter.into())
+            .from_env_lossy()
+    };
+
+    let file_appender = RollingFileAppender::builder()
+        .max_log_files(7)
+        .rotation(Rotation::DAILY)
+        .filename_prefix("oabs_server")
+        .filename_suffix("log")
+        .build(logs_dir.clone())?;
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_writer(non_blocking)
+        .with_ansi(false)
+        .with_filter(default_filter(LevelFilter::DEBUG))
+        .boxed();
+
+    let stdout_layer = tracing_subscriber::fmt::layer()
+        .with_filter(default_filter(LevelFilter::DEBUG))
+        .boxed();
+
+    let mut layers = Vec::new();
+    layers.push(file_layer);
+    layers.push(stdout_layer);
+    tracing_subscriber::registry().with(layers).init();
+
+    // App
+
+    let server_addr = SocketAddr::new("0.0.0.0".parse()?, opt.port);
 
     let host = cpal::default_host();
 
-    let input_devices: Vec<Device> = host.input_devices()?.collect();
+    let input_devices: Vec<Device> = host.input_devices()?.filter(|x| x.name().is_ok()).collect();
 
     let devices_names = input_devices
         .iter()
-        .filter(|x| x.name().is_ok())
         .map(|x| x.name().unwrap_or(String::new()))
         .collect::<Vec<String>>();
 
-    println!("{devices_names:?}");
+    let selection = FuzzySelect::with_theme(&ColorfulTheme::default())
+        .with_prompt("Select the device to capture")
+        .items(&devices_names)
+        .interact()?;
 
-    let selected_name = "Voicemeeter Out B3 (VB-Audio Voicemeeter VAIO)";
+    let selected_name = &devices_names[selection];
 
     let device = input_devices
         .into_iter()
-        .find(|p| p.name().is_ok_and(|n| n == selected_name))
+        .find(|p| p.name().is_ok_and(|n| &n == selected_name))
         .ok_or(anyhow!(
             "Selected device {selected_name:?} could not be found"
         ))?;
 
-    let config = device
-        .default_input_config()
-        .map_err(|e| anyhow!("Failed to get default input config: {e}"))?;
+    let configs = device
+        .supported_input_configs()?
+        .filter(|c| c.sample_format() == SampleFormat::F32)
+        .filter_map(|c| {
+            c.try_with_sample_rate(SampleRate(44100))
+                .or(c.try_with_sample_rate(c.min_sample_rate()))
+        })
+        .collect::<Vec<SupportedStreamConfig>>();
 
-    // A flag to indicate that recording is in progress.
-    println!("Begin recording...");
+    let config = configs
+        .first()
+        .ok_or(anyhow!("Could not find a valid configuration"))?;
 
     // Run the input stream on a separate thread.
 
@@ -143,96 +207,49 @@ async fn main() -> Result<()> {
     let (stream_close_tx, stream_close_rx) = mpsc::channel();
     let (data_send_tx, data_send_rx) = mpsc::channel();
 
-    println!("Sample Format {:?}", config.sample_format());
+    debug!("Sample Format {:?}", config.sample_format());
 
     let err_fn = move |err| {
-        eprintln!("an error occurred on stream: {}", err);
+        error!("an error occurred on stream: {}", err);
     };
 
     let config_clone = config.clone();
     let stream_thread = std::thread::spawn(move || -> Result<()> {
-        let stream = match config_clone.sample_format() {
-            // SampleFormat::I8 => device.build_input_stream(
-            //     &config_clone.into(),
-            //     move |data: &[i8], _: &_| {
-            //         let _ = data_send_tx.send(SampleData {
-            //             data: data
-            //                 .into_iter()
-            //                 .flat_map(|v| v.to_be_bytes())
-            //                 .collect::<Vec<u8>>(),
-            //         });
-            //     },
-            //     err_fn,
-            //     None,
-            // )?,
-            // SampleFormat::I16 => device.build_input_stream(
-            //     &config_clone.into(),
-            //     move |data: &[i16], _: &_| {
-            //         let _ = data_send_tx.send(SampleData {
-            //             data: data
-            //                 .into_iter()
-            //                 .flat_map(|v| v.to_be_bytes())
-            //                 .collect::<Vec<u8>>(),
-            //         });
-            //     },
-            //     err_fn,
-            //     None,
-            // )?,
-            // SampleFormat::I32 => device.build_input_stream(
-            //     &config_clone.into(),
-            //     move |data: &[i32], _: &_| {
-            //         let _ = data_send_tx.send(SampleData {
-            //             data: data
-            //                 .into_iter()
-            //                 .flat_map(|v| v.to_be_bytes())
-            //                 .collect::<Vec<u8>>(),
-            //         });
-            //     },
-            //     err_fn,
-            //     None,
-            // )?,
-            SampleFormat::F32 => device.build_input_stream(
-                &config_clone.into(),
-                move |data: &[f32], _| {
-                    let mut encoded_data: Vec<u8> = Vec::new();
-                    let sampling_frequency = NonZeroU32::new(48000).ok_or(anyhow!("WUT")).unwrap();
-                    let channels = NonZeroU8::new(1).ok_or(anyhow!("WUT")).unwrap();
-                    {
-                        let mut encoder = VorbisEncoderBuilder::new(
-                            sampling_frequency,
-                            channels,
-                            &mut encoded_data,
-                        )
-                        .unwrap()
-                        .build()
-                        .unwrap();
-                        let encode_result = encoder.encode_audio_block([data]);
-                        if let Err(err) = encode_result {
-                            eprintln!("Encoding Error: {err:?}")
-                        }
+        let stream = device.build_input_stream(
+            &config_clone.into(),
+            move |data: &[f32], _| {
+                let mut encoded_data: Vec<u8> = Vec::new();
+                let sampling_frequency = NonZeroU32::new(48000).ok_or(anyhow!("WUT")).unwrap();
+                let channels = NonZeroU8::new(1).ok_or(anyhow!("WUT")).unwrap();
+                {
+                    let mut encoder =
+                        VorbisEncoderBuilder::new(sampling_frequency, channels, &mut encoded_data)
+                            .unwrap()
+                            .build()
+                            .unwrap();
+                    let encode_result = encoder.encode_audio_block([data]);
+                    if let Err(err) = encode_result {
+                        error!("Encoding Error: {err:?}")
                     }
-                    let mut samples = Vec::new();
-                    samples.extend_from_slice(&data);
-                    let _ = data_send_tx.send(encoded_data);
-                },
-                err_fn,
-                None,
-            )?,
-            sample_format => {
-                return Err(anyhow::Error::msg(format!(
-                    "Unsupported sample format '{sample_format}'"
-                )))
-            }
-        };
+                }
+                let mut samples = Vec::new();
+                samples.extend_from_slice(&data);
+                let _ = data_send_tx.send(encoded_data);
+            },
+            err_fn,
+            None,
+        )?;
 
+        debug!("Begin recording");
         stream.play()?;
         loop {
             if stream_close_rx.recv()? {
-                println!("Closing stream thread");
+                debug!("Closing stream thread");
                 break;
             }
         }
         stream.pause()?;
+        debug!("Stopped recording");
 
         drop(stream);
 
@@ -240,7 +257,11 @@ async fn main() -> Result<()> {
     });
 
     let stream_joinh = tokio::spawn(stream_server(server_addr, data_send_rx, close_rx.clone()));
-    let payload_joinh = tokio::spawn(payload_server(server_addr, config, close_rx.clone()));
+    let payload_joinh = tokio::spawn(payload_server(
+        server_addr,
+        config.clone(),
+        close_rx.clone(),
+    ));
 
     #[cfg(not(target_os = "windows"))]
     {
@@ -264,10 +285,10 @@ async fn main() -> Result<()> {
 
     close_tx.send(true)?;
     if let Err(e) = stream_joinh.await? {
-        eprintln!("{e:?}");
+        error!("{e:?}");
     }
     if let Err(e) = payload_joinh.await? {
-        eprintln!("{e:?}");
+        error!("{e:?}");
     }
 
     stream_close_tx.send(true)?;
@@ -275,7 +296,7 @@ async fn main() -> Result<()> {
         .join()
         .map_err(|e| anyhow!("Could not join stream thread: {e:?}"))??;
 
-    println!("Server closed successfully");
+    debug!("Server closed successfully");
 
     Ok(())
 }

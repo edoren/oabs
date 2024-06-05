@@ -4,8 +4,10 @@ use anyhow::{anyhow, Result};
 use clap::Parser;
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
-    SampleFormat,
+    Device, SampleFormat,
 };
+use dialoguer::{theme::ColorfulTheme, FuzzySelect};
+use log::{debug, error};
 use oabs_lib::SupportedStreamConfigDeserialize;
 use ringbuf::{
     traits::{Consumer, Producer, Split},
@@ -17,12 +19,16 @@ use tokio::{
     signal,
     sync::watch,
 };
+use tracing_appender::rolling::{RollingFileAppender, Rotation};
+use tracing_subscriber::{
+    filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
+};
 use vorbis_rs::VorbisDecoder;
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Client", long_about = None)]
 struct Opt {
-    /// The input audio device to use
+    /// The server address to connect to
     #[arg(short, long, value_name = "SERVER", default_value_t = String::from("127.0.0.1:48182"))]
     server: String,
 
@@ -35,17 +41,66 @@ struct Opt {
 async fn main() -> Result<()> {
     let opt = Opt::parse();
 
+    let app_config_dir = dirs::config_dir()
+        .ok_or(anyhow!("Could not get config dir"))?
+        .join("oabs");
+
+    // Logging
+
+    let logs_dir = app_config_dir.join("logs");
+    let default_filter = |filter: LevelFilter| {
+        EnvFilter::builder()
+            .with_default_directive(filter.into())
+            .from_env_lossy()
+    };
+
+    let file_appender = RollingFileAppender::builder()
+        .max_log_files(7)
+        .rotation(Rotation::DAILY)
+        .filename_prefix("oabs")
+        .filename_suffix("log")
+        .build(logs_dir.clone())?;
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_writer(non_blocking)
+        .with_ansi(false)
+        .with_filter(default_filter(LevelFilter::DEBUG))
+        .boxed();
+
+    let stdout_layer = tracing_subscriber::fmt::layer()
+        .with_filter(default_filter(LevelFilter::DEBUG))
+        .boxed();
+
+    let mut layers = Vec::new();
+    layers.push(file_layer);
+    layers.push(stdout_layer);
+    tracing_subscriber::registry().with(layers).init();
+
+    // App
+
     let host = cpal::default_host();
 
-    let device = host
-        .default_output_device()
-        .ok_or(anyhow!("Could not find default output device"))?;
+    let output_devices: Vec<Device> = host
+        .output_devices()?
+        .filter(|x| x.name().is_ok())
+        .collect();
 
-    println!("{:?}", device.name());
+    let devices_names = output_devices
+        .iter()
+        .map(|x| x.name().unwrap_or(String::new()))
+        .collect::<Vec<String>>();
+
+    let selection = FuzzySelect::with_theme(&ColorfulTheme::default())
+        .with_prompt("Select the output device")
+        .default(0)
+        .items(&devices_names)
+        .interact()?;
+
+    let device = &output_devices[selection];
 
     let remote_addr: SocketAddr = opt.server.parse()?;
 
-    println!("Connecting to server {}", opt.server);
+    debug!("Connecting to server {}", opt.server);
     let mut stream = TcpStream::connect(remote_addr).await?;
 
     // Wait for the socket to be readable
@@ -75,7 +130,7 @@ async fn main() -> Result<()> {
     let latency_samples = latency_frames as usize * config.channels() as usize;
 
     let buffer_size = latency_samples * 2 * 4;
-    println!("Buffer Size: {buffer_size}");
+    debug!("Buffer Size: {buffer_size}");
 
     // The buffer to share samples
     let ring = HeapRb::<f32>::new(latency_samples * 2);
@@ -104,7 +159,7 @@ async fn main() -> Result<()> {
     //     .map_err(|e| anyhow!("Failed to get default input config: {e}"))?;
 
     // // A flag to indicate that recording is in progress.
-    // println!("Begin recording...");
+    // debug!("Begin recording...");
 
     // // Run the input stream on a separate thread.
 
@@ -112,10 +167,10 @@ async fn main() -> Result<()> {
     let (player_close_tx, player_close_rx) = mpsc::channel();
     // let (data_recv_tx, data_recv_rx) = mpsc::channel::<SampleData>();
 
-    // println!("Sample Format {:?}", config.sample_format());
+    // debug!("Sample Format {:?}", config.sample_format());
 
     let err_fn = move |err| {
-        eprintln!("an error occurred on stream: {}", err);
+        error!("an error occurred on stream: {}", err);
     };
 
     let mut close_rx_stream_receiver_task = close_rx.clone();
@@ -153,7 +208,7 @@ async fn main() -> Result<()> {
                         let data_count = channel1.len();
                         let written_count = producer.push_slice(channel1);
                         if written_count < data_count {
-                            eprintln!("output stream fell behind: try increasing latency");
+                            error!("output stream fell behind: try increasing latency");
                         }
                     }
                 }
@@ -164,93 +219,28 @@ async fn main() -> Result<()> {
     };
 
     let config_clone = config.clone();
+    let device_clone = device.clone();
     let player_task = move || -> Result<()> {
         let stream = match config_clone.sample_format() {
-            // SampleFormat::I8 => device.build_output_stream(
-            //     &config_clone.into(),
-            //     move |data: &mut [i8], _: &_| {
-            //         let result = data_recv_rx.recv();
-            //         for sample in data {
-            //             *sample = match consumer.try_pop() {
-            //                 Some(s) => s,
-            //                 None => {
-            //                     input_fell_behind = true;
-            //                     0.0
-            //                 }
-            //             };
-            //         }
-
-            //         if let Ok(sample) = result {
-            //             let result: Vec<i8> = sample
-            //                 .data
-            //                 .chunks_exact(1)
-            //                 .map(TryInto::try_into)
-            //                 .map(Result::unwrap)
-            //                 .map(i8::from_be_bytes)
-            //                 .collect();
-            //         }
-            //         let _ = data_send_tx.send(SampleData {
-            //             format: SampleFormat::I8,
-            //             data: data
-            //                 .into_iter()
-            //                 .flat_map(|v| v.to_be_bytes())
-            //                 .collect::<Vec<u8>>(),
-            //         });
-            //     },
-            //     err_fn,
-            //     None,
-            // )?,
-            // SampleFormat::I16 => device.build_output_stream(
-            //     &config_clone.into(),
-            //     move |data: &mut [i16], _: &_| {
-            //         let _ = data_send_tx.send(SampleData {
-            //             format: SampleFormat::I16,
-            //             data: data
-            //                 .into_iter()
-            //                 .flat_map(|v| v.to_be_bytes())
-            //                 .collect::<Vec<u8>>(),
-            //         });
-            //     },
-            //     err_fn,
-            //     None,
-            // )?,
-            // SampleFormat::I32 => device.build_output_stream(
-            //     &config_clone.into(),
-            //     move |data: &mut [i32], _: &_| {
-            //         let _ = data_send_tx.send(SampleData {
-            //             format: SampleFormat::I32,
-            //             data: data
-            //                 .into_iter()
-            //                 .flat_map(|v| v.to_be_bytes())
-            //                 .collect::<Vec<u8>>(),
-            //         });
-            //     },
-            //     err_fn,
-            //     None,
-            // )?,
-            SampleFormat::F32 => device.build_output_stream(
+            SampleFormat::F32 => device_clone.build_output_stream(
                 &config_clone.into(),
                 move |data: &mut [f32], _: &_| {
                     let received_count = data.len();
                     let read_count = consumer.pop_slice(data);
                     if read_count < received_count {
-                        eprintln!("input stream fell behind: try increasing latency");
+                        error!("input stream fell behind: try increasing latency");
                     }
                 },
                 err_fn,
                 None,
             )?,
-            sample_format => {
-                return Err(anyhow::Error::msg(format!(
-                    "Unsupported sample format '{sample_format}'"
-                )))
-            }
+            sample_format => return Err(anyhow!("Unsupported sample format '{sample_format}'")),
         };
 
         stream.play()?;
         loop {
             if player_close_rx.recv()? {
-                println!("Closing stream thread");
+                debug!("Closing stream thread");
                 break;
             }
         }
@@ -261,7 +251,7 @@ async fn main() -> Result<()> {
         Ok(())
     };
 
-    println!("{config:?}");
+    debug!("{config:?}");
 
     let stream_receiver_joinh = tokio::spawn(stream_receiver_task);
     let player_joinh = std::thread::spawn(player_task);
@@ -286,7 +276,7 @@ async fn main() -> Result<()> {
             result = stream.read_i32() => {
                 if let Ok(result) = result {
                     if result == -1 {
-                        println!("Server closed");
+                        debug!("Server closed");
                     }
                 }
              }
@@ -295,7 +285,7 @@ async fn main() -> Result<()> {
 
     close_tx.send(true)?;
     if let Err(e) = stream_receiver_joinh.await? {
-        eprintln!("{e:?}");
+        error!("{e:?}");
     };
 
     player_close_tx.send(true)?;
@@ -303,7 +293,7 @@ async fn main() -> Result<()> {
         .join()
         .map_err(|e| anyhow!("Could not join stream thread: {e:?}"))??;
 
-    println!("Client closed successfully");
+    debug!("Client closed successfully");
 
     Ok(())
 }
