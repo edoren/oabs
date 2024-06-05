@@ -87,23 +87,31 @@ async fn main_ex() -> Result<()> {
 
     let host = cpal::default_host();
 
-    let output_devices: Vec<Device> = host
-        .output_devices()?
-        .filter(|x| x.name().is_ok())
-        .collect();
+    #[cfg(not(target_os = "android"))]
+    let device = {
+        let output_devices: Vec<Device> = host
+            .output_devices()?
+            .filter(|x| x.name().is_ok())
+            .collect();
 
-    let devices_names = output_devices
-        .iter()
-        .map(|x| x.name().unwrap_or(String::new()))
-        .collect::<Vec<String>>();
+        let devices_names = output_devices
+            .iter()
+            .map(|x| x.name().unwrap_or(String::new()))
+            .collect::<Vec<String>>();
 
-    let selection = FuzzySelect::with_theme(&ColorfulTheme::default())
-        .with_prompt("Select the output device")
-        .default(0)
-        .items(&devices_names)
-        .interact()?;
+        let selection = FuzzySelect::with_theme(&ColorfulTheme::default())
+            .with_prompt("Select the output device")
+            .default(0)
+            .items(&devices_names)
+            .interact()?;
 
-    let device = &output_devices[selection];
+        output_devices[selection].clone()
+    };
+
+    #[cfg(target_os = "android")]
+    let device = host
+        .default_output_device()
+        .ok_or(anyhow!("Could not find default output device"))?;
 
     let remote_addr: SocketAddr = opt.server.parse()?;
 
