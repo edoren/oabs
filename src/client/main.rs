@@ -1,13 +1,13 @@
-use std::{net::SocketAddr, result, sync::mpsc};
+use std::{net::SocketAddr, sync::mpsc};
 
 use anyhow::{anyhow, Result};
 use clap::Parser;
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
-    Device, SampleFormat,
+    Device,
 };
 use dialoguer::{theme::ColorfulTheme, FuzzySelect};
-use log::{debug, error};
+use log::{debug, error, info};
 use oabs_lib::SupportedStreamConfigDeserialize;
 use ringbuf::{
     traits::{Consumer, Producer, Split},
@@ -119,25 +119,24 @@ async fn main_ex() -> Result<()> {
 
     // Try to read data, this may still fail with `WouldBlock`
     // if the readiness event is a false positive.
-    let config = match stream.try_read(&mut buf) {
-        Ok(n) => {
-            let payload = std::str::from_utf8(&buf[0..n])?;
-            serde_json::from_str(payload).map(|SupportedStreamConfigDeserialize(dur)| dur)?
-        }
-        // Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-        //     continue;
-        // }
-        Err(e) => {
-            return Err(e.into());
+    let config = loop {
+        match stream.try_read(&mut buf) {
+            Ok(n) => {
+                break serde_json::from_slice(&buf[0..n])
+                    .map(|SupportedStreamConfigDeserialize(dur)| dur)?;
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                continue;
+            }
+            Err(e) => {
+                return Err(e.into());
+            }
         }
     };
 
     // Create a delay in case the input and output devices aren't synced.
     let latency_frames = (opt.latency / 1_000.0) * config.sample_rate().0 as f32;
     let latency_samples = latency_frames as usize * config.channels() as usize;
-
-    let buffer_size = latency_samples * 2 * 4;
-    debug!("Buffer Size: {buffer_size}");
 
     // The buffer to share samples
     let ring = HeapRb::<f32>::new(latency_samples * 2);
@@ -152,29 +151,8 @@ async fn main_ex() -> Result<()> {
             .map_err(|e| anyhow!("Could not fill buffer: {e}"))?;
     }
 
-    // let selected_name = "Voicemeeter Out B3 (VB-Audio Voicemeeter VAIO)";
-
-    // let device = input_devices
-    //     .into_iter()
-    //     .find(|p| p.name().is_ok_and(|n| n == selected_name))
-    //     .ok_or(anyhow!(
-    //         "Selected device {selected_name:?} could not be found"
-    //     ))?;
-
-    // let config = device
-    //     .default_input_config()
-    //     .map_err(|e| anyhow!("Failed to get default input config: {e}"))?;
-
-    // // A flag to indicate that recording is in progress.
-    // debug!("Begin recording...");
-
-    // // Run the input stream on a separate thread.
-
     let (close_tx, close_rx) = watch::channel(false);
     let (player_close_tx, player_close_rx) = mpsc::channel();
-    // let (data_recv_tx, data_recv_rx) = mpsc::channel::<SampleData>();
-
-    // debug!("Sample Format {:?}", config.sample_format());
 
     let err_fn = move |err| {
         error!("an error occurred on stream: {}", err);
@@ -182,12 +160,9 @@ async fn main_ex() -> Result<()> {
 
     let mut close_rx_stream_receiver_task = close_rx.clone();
     let stream_receiver_task = async move {
-        let local_addr: SocketAddr = if remote_addr.is_ipv4() {
-            "0.0.0.0:12312".parse()?
-        } else {
-            "[::]:0".parse()?
-        };
+        let local_addr: SocketAddr = "0.0.0.0:12312".parse()?;
         let cli = UdpSocket::bind(local_addr).await?;
+        debug!("Using local address: {}", cli.local_addr()?);
         cli.connect(remote_addr).await?;
         let mut buf = [0; 5120];
 
@@ -228,33 +203,35 @@ async fn main_ex() -> Result<()> {
     let config_clone = config.clone();
     let device_clone = device.clone();
     let player_task = move || -> Result<()> {
-        let stream = match config_clone.sample_format() {
-            SampleFormat::F32 => device_clone.build_output_stream(
-                &config_clone.into(),
-                move |data: &mut [f32], _: &_| {
-                    let received_count = data.len();
-                    let read_count = consumer.pop_slice(data);
-                    if read_count < received_count {
-                        error!("input stream fell behind: try increasing latency");
-                    }
-                },
-                err_fn,
-                None,
-            )?,
-            sample_format => return Err(anyhow!("Unsupported sample format '{sample_format}'")),
-        };
+        debug!("Creating playback thread");
 
+        let stream = device_clone.build_output_stream(
+            &config_clone.into(),
+            move |data: &mut [f32], _: &_| {
+                let received_count = data.len();
+                let read_count = consumer.pop_slice(data);
+                if read_count < received_count {
+                    error!("input stream fell behind: try increasing latency");
+                }
+            },
+            err_fn,
+            None,
+        )?;
+
+        info!("Starting playback");
         stream.play()?;
         loop {
             if player_close_rx.recv()? {
-                debug!("Closing stream thread");
+                debug!("Playback thread");
                 break;
             }
         }
+        info!("Stopping playback");
         stream.pause()?;
 
         drop(stream);
 
+        debug!("Stopping playback thread");
         Ok(())
     };
 
