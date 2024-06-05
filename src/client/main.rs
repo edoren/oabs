@@ -40,41 +40,39 @@ struct Opt {
 async fn main_ex() -> Result<()> {
     let opt = Opt::parse();
 
+    let app_config_dir = dirs::config_dir()
+        .ok_or(anyhow!("Could not get config dir"))?
+        .join("oabs");
+
     // Logging
+
+    let logs_dir = app_config_dir.join("logs");
     let default_filter = |filter: LevelFilter| {
         EnvFilter::builder()
             .with_default_directive(filter.into())
             .from_env_lossy()
     };
 
-    let mut layers = Vec::new();
-
-    #[cfg(not(target_os = "android"))]
-    {
-        let app_config_dir = dirs::config_dir()
-            .ok_or(anyhow!("Could not get config dir"))?
-            .join("oabs");
-        let logs_dir = app_config_dir.join("logs");
-        let file_appender = RollingFileAppender::builder()
-            .max_log_files(7)
-            .rotation(Rotation::DAILY)
-            .filename_prefix("oabs")
-            .filename_suffix("log")
-            .build(logs_dir.clone())?;
-        let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
-        let file_layer = tracing_subscriber::fmt::layer()
-            .with_writer(non_blocking)
-            .with_ansi(false)
-            .with_filter(default_filter(LevelFilter::DEBUG))
-            .boxed();
-        layers.push(file_layer);
-    }
+    let file_appender = RollingFileAppender::builder()
+        .max_log_files(7)
+        .rotation(Rotation::DAILY)
+        .filename_prefix("oabs")
+        .filename_suffix("log")
+        .build(logs_dir.clone())?;
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_writer(non_blocking)
+        .with_ansi(false)
+        .with_filter(default_filter(LevelFilter::DEBUG))
+        .boxed();
 
     let stdout_layer = tracing_subscriber::fmt::layer()
         .with_filter(default_filter(LevelFilter::DEBUG))
         .boxed();
-    layers.push(stdout_layer);
 
+    let mut layers = Vec::new();
+    layers.push(file_layer);
+    layers.push(stdout_layer);
     tracing_subscriber::registry().with(layers).init();
 
     // App
