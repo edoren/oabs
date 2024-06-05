@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, sync::mpsc};
+use std::{net::SocketAddr, result, sync::mpsc};
 
 use anyhow::{anyhow, Result};
 use clap::Parser;
@@ -37,8 +37,7 @@ struct Opt {
     latency: f32,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+async fn main_ex() -> Result<()> {
     let opt = Opt::parse();
 
     // Logging
@@ -297,5 +296,15 @@ async fn main() -> Result<()> {
 
     debug!("Client closed successfully");
 
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let result = main_ex().await;
+    if let Err(err) = result {
+        error!("{err}");
+        return Err(err);
+    }
     Ok(())
 }
