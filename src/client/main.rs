@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, result, sync::mpsc};
+use std::{net::SocketAddr, sync::mpsc};
 
 use anyhow::{anyhow, Result};
 use clap::Parser;
@@ -41,16 +41,16 @@ async fn main_ex() -> Result<()> {
     let opt = Opt::parse();
 
     // Logging
-    let default_filter = |filter: LevelFilter| {
-        EnvFilter::builder()
-            .with_default_directive(filter.into())
-            .from_env_lossy()
-    };
-
     let mut layers = Vec::new();
 
     #[cfg(not(target_os = "android"))]
     {
+        let default_filter = |filter: LevelFilter| {
+            EnvFilter::builder()
+                .with_default_directive(filter.into())
+                .from_env_lossy()
+        };
+
         let app_config_dir = dirs::config_dir()
             .ok_or(anyhow!("Could not get config dir"))?
             .join("oabs");
@@ -68,12 +68,18 @@ async fn main_ex() -> Result<()> {
             .with_filter(default_filter(LevelFilter::DEBUG))
             .boxed();
         layers.push(file_layer);
+
+        let stdout_layer = tracing_subscriber::fmt::layer()
+            .with_filter(default_filter(LevelFilter::DEBUG))
+            .boxed();
+        layers.push(stdout_layer);
     }
 
-    let stdout_layer = tracing_subscriber::fmt::layer()
-        .with_filter(default_filter(LevelFilter::DEBUG))
-        .boxed();
-    layers.push(stdout_layer);
+    #[cfg(target_os = "android")]
+    {
+        let stdout_layer = tracing_subscriber::fmt::layer().boxed();
+        layers.push(stdout_layer);
+    }
 
     tracing_subscriber::registry().with(layers).init();
 
