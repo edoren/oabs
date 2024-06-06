@@ -55,7 +55,7 @@ impl From<SupportedStreamConfigDef> for SupportedStreamConfig {
             def.channels,
             def.sample_rate,
             def.buffer_size,
-            SampleFormat::F32,
+            def.sample_format,
         )
     }
 }
@@ -69,3 +69,11 @@ pub struct SupportedStreamConfigSerialize<'a>(
 pub struct SupportedStreamConfigDeserialize(
     #[serde(with = "SupportedStreamConfigDef")] pub SupportedStreamConfig,
 );
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum OABSMessage {
+    ClientConnected {},
+    ClientId { id: String },
+    ClientDisconnected {},
+}

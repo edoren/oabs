@@ -1,8 +1,11 @@
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     net::SocketAddr,
     num::{NonZeroU32, NonZeroU8},
-    sync::mpsc::{self, Receiver},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc::{self, Receiver},
+    },
 };
 
 use anyhow::{anyhow, Result};
@@ -13,19 +16,24 @@ use cpal::{
 };
 use dialoguer::{theme::ColorfulTheme, FuzzySelect};
 use log::{debug, error};
-use oabs_lib::SupportedStreamConfigSerialize;
+use oabs_lib::{OABSMessage, SupportedStreamConfigSerialize};
 use tokio::{
-    io::AsyncWriteExt,
-    net::{TcpListener, UdpSocket},
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream, UdpSocket},
     signal,
     sync::watch,
-    task::yield_now,
+    task::{yield_now, JoinSet},
 };
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{
     filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
 };
 use vorbis_rs::VorbisEncoderBuilder;
+
+enum ClientStatus {
+    Connected { id: String },
+    Disconnected { id: String },
+}
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Server", long_about = None)]
@@ -35,28 +43,87 @@ struct Opt {
     port: u16,
 
     /// Specify the delay between input and output
-    #[arg(short, long, value_name = "DELAY_MS", default_value_t = 150.0)]
-    latency: f32,
+    #[arg(short, long, value_name = "MAX_CLIENTS", default_value_t = 5)]
+    max_connections: u16,
 
     /// Specify the delay between input and output
     #[arg(short, long, value_name = "VERBOSE", default_value_t = false)]
     verbose: bool,
 }
 
+static COUNTER: AtomicUsize = AtomicUsize::new(1);
+fn get_id() -> usize {
+    COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+async fn client_handler(
+    mut socket: TcpStream,
+    config: SupportedStreamConfig,
+    mut close_rx: watch::Receiver<bool>,
+    client_status_tx: tokio::sync::mpsc::Sender<ClientStatus>,
+) -> Result<()> {
+    let client_id = get_id().to_string();
+
+    debug!(
+        "Sending to {:?} payload {:?}",
+        socket.peer_addr()?,
+        client_id
+    );
+    let someting = serde_json::to_vec(&OABSMessage::ClientId {
+        id: client_id.clone(),
+    })?;
+    socket.write(&someting).await?;
+
+    debug!("Sending to {:?} payload {:?}", socket.peer_addr()?, config);
+    let value = serde_json::to_vec(&SupportedStreamConfigSerialize(&config))?;
+    socket.write(&value).await?;
+
+    let _ = client_status_tx
+        .send(ClientStatus::Connected {
+            id: client_id.clone(),
+        })
+        .await;
+
+    let client_id_cloned = client_id.clone();
+    tokio::select! {
+        _ = async move {
+            loop {
+                let mut buf = [];
+
+                match socket.read(&mut buf).await {
+                    Ok(0) | Err(_)
+                     => {
+                        // TODO: PING
+                        let _ = client_status_tx.send(ClientStatus::Disconnected { id: client_id_cloned }).await;
+                        break;
+                    },
+                    _ => {}
+                }
+            }
+        } => {},
+        _ = close_rx.changed() => {}
+    };
+
+    debug!("Client closed with id: {client_id}");
+
+    Ok(())
+}
+
 async fn payload_server(
     server_addr: SocketAddr,
     config: SupportedStreamConfig,
     mut close_rx: watch::Receiver<bool>,
+    client_status_tx: tokio::sync::mpsc::Sender<ClientStatus>,
 ) -> Result<()> {
     debug!("Starting Payload Server");
+
     let listener = TcpListener::bind(server_addr).await?;
     debug!("Payload server listening on: {}", listener.local_addr()?);
-    let mut sockets = Vec::new();
+    let mut sockets = JoinSet::new();
     loop {
-        let mut socket;
-        tokio::select! {
+        let socket = tokio::select! {
             result = listener.accept() => {
-                socket = result?.0;
+                result?.0
             },
             result = close_rx.changed() => {
                 if result.is_ok() && *close_rx.borrow_and_update() {
@@ -65,14 +132,16 @@ async fn payload_server(
                 continue;
             }
         };
-        debug!("Sending to {:?} payload {:?}", socket.peer_addr(), config);
-        let value = serde_json::to_string(&SupportedStreamConfigSerialize(&config))?;
-        socket.write(value.as_bytes()).await?;
-        sockets.push(socket);
+        sockets.spawn(client_handler(
+            socket,
+            config.clone(),
+            close_rx.clone(),
+            client_status_tx.clone(),
+        ));
     }
-    for mut socket in sockets {
-        let _ = socket.write_i32(-1).await;
-    }
+
+    while let Some(_res) = sockets.join_next().await {}
+
     debug!("Stopping Payload Server");
     Ok(())
 }
@@ -81,12 +150,15 @@ async fn stream_server(
     server_addr: SocketAddr,
     data_send_rx: Receiver<Vec<u8>>,
     mut close_rx: watch::Receiver<bool>,
+    mut client_status_rx: tokio::sync::mpsc::Receiver<ClientStatus>,
 ) -> Result<()> {
     debug!("Starting Stream Server");
+
     let sock = UdpSocket::bind(server_addr).await?;
     debug!("Stream server listening on: {}", sock.local_addr()?);
+
     let mut buffer = [0; 8];
-    let mut interested = HashSet::new();
+    let mut registered_clients: HashMap<String, Option<SocketAddr>> = HashMap::new();
     loop {
         if let Ok(changed) = close_rx.has_changed() {
             if changed && *close_rx.borrow_and_update() {
@@ -94,30 +166,44 @@ async fn stream_server(
             }
         }
 
+        if let Ok(client_status) = client_status_rx.try_recv() {
+            match client_status {
+                ClientStatus::Connected { id } => {
+                    registered_clients.insert(id, None);
+                }
+                ClientStatus::Disconnected { id } => {
+                    registered_clients.remove(&id);
+                    debug!("Removing client with id {id}");
+                }
+            }
+        }
+
+        if let Ok((len, source)) = sock.try_recv_from(&mut buffer) {
+            let msg = unsafe { std::str::from_utf8_unchecked(&buffer[..len]) };
+            if msg.starts_with("START") {
+                let id = msg.split(" ").nth(1).unwrap();
+                registered_clients.insert(id.into(), Some(source));
+                debug!("Added interested {source} with id {id}");
+            }
+        }
+
         let samples = loop {
             let result = data_send_rx.recv();
             if let Ok(data) = result {
                 break data;
-            } else {
-                // sleep(Duration::from_millis(10)).await;
             }
             yield_now().await;
         };
 
-        if let Ok((len, source)) = sock.try_recv_from(&mut buffer) {
-            let msg = unsafe { std::str::from_utf8_unchecked(&buffer[..len]) };
-            if msg == "START" {
-                interested.insert(source);
+        for source in registered_clients.values() {
+            if let Some(source) = source {
+                let _len = sock.send_to(&samples, source).await?;
             }
-        }
-
-        for source in &interested {
-            let _len = sock.send_to(&samples, source).await?;
-            // debug!("{:?} bytes sent to {}", len, source);
         }
 
         yield_now().await;
     }
+
     debug!("Stopping Stream Server");
     Ok(())
 }
@@ -206,6 +292,7 @@ async fn main() -> Result<()> {
     let (close_tx, close_rx) = watch::channel(false);
     let (stream_close_tx, stream_close_rx) = mpsc::channel();
     let (data_send_tx, data_send_rx) = mpsc::channel();
+    let (client_status_tx, client_status_rx) = tokio::sync::mpsc::channel::<ClientStatus>(100);
 
     debug!("Sample Format {:?}", config.sample_format());
 
@@ -256,11 +343,17 @@ async fn main() -> Result<()> {
         Ok(())
     });
 
-    let stream_joinh = tokio::spawn(stream_server(server_addr, data_send_rx, close_rx.clone()));
+    let stream_joinh = tokio::spawn(stream_server(
+        server_addr,
+        data_send_rx,
+        close_rx.clone(),
+        client_status_rx,
+    ));
     let payload_joinh = tokio::spawn(payload_server(
         server_addr,
         config.clone(),
         close_rx.clone(),
+        client_status_tx,
     ));
 
     #[cfg(not(target_os = "windows"))]

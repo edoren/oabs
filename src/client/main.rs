@@ -8,7 +8,7 @@ use cpal::{
 };
 use dialoguer::{theme::ColorfulTheme, FuzzySelect};
 use log::{debug, error, info};
-use oabs_lib::SupportedStreamConfigDeserialize;
+use oabs_lib::{OABSMessage, SupportedStreamConfigDeserialize};
 use ringbuf::{
     traits::{Consumer, Producer, Split},
     HeapRb,
@@ -35,6 +35,12 @@ struct Opt {
     /// Specify the delay between input and output
     #[arg(short, long, value_name = "DELAY_MS", default_value_t = 150.0)]
     latency: f32,
+}
+
+enum StreamStatus {
+    Starting,
+    Streaming,
+    Stopped,
 }
 
 async fn main_ex() -> Result<()> {
@@ -117,6 +123,25 @@ async fn main_ex() -> Result<()> {
     // being stored in the async task.
     let mut buf = [0; 256];
 
+    let client_id: String = loop {
+        match stream.try_read(&mut buf) {
+            Ok(n) => {
+                let value: OABSMessage = serde_json::from_slice(&buf[0..n])?;
+                if let OABSMessage::ClientId { id } = value {
+                    break id;
+                }
+                return Err(anyhow!("Client id not found"));
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                continue;
+            }
+            Err(e) => {
+                return Err(e.into());
+            }
+        }
+    };
+    debug!("Receiving client_id {:?}", client_id);
+
     // Try to read data, this may still fail with `WouldBlock`
     // if the readiness event is a false positive.
     let config = loop {
@@ -133,6 +158,8 @@ async fn main_ex() -> Result<()> {
             }
         }
     };
+
+    debug!("Receiving config {:?}", config);
 
     // Create a delay in case the input and output devices aren't synced.
     let latency_frames = (opt.latency / 1_000.0) * config.sample_rate().0 as f32;
@@ -166,13 +193,23 @@ async fn main_ex() -> Result<()> {
         cli.connect(remote_addr).await?;
         let mut buf = [0; 5120];
 
-        cli.send("START".as_bytes()).await?;
-
+        let mut stream_status = StreamStatus::Starting;
         loop {
-            let recv_result;
-            tokio::select! {
+            match stream_status {
+                StreamStatus::Starting => {
+                    cli.send(format!("START {client_id}").as_bytes()).await?;
+                    stream_status = StreamStatus::Streaming;
+                }
+                StreamStatus::Streaming => {}
+                StreamStatus::Stopped => {}
+            };
+
+            let recv_len = tokio::select! {
                 result = cli.recv(&mut buf) => {
-                    recv_result = result;
+                    match result {
+                        Ok(len) => len,
+                        Err(_e) => continue,
+                    }
                 },
                 result = close_rx_stream_receiver_task.changed() => {
                     if result.is_ok() && *close_rx_stream_receiver_task.borrow_and_update() {
@@ -182,9 +219,12 @@ async fn main_ex() -> Result<()> {
                 }
             };
 
-            match recv_result {
-                Ok(len) => {
-                    let mut decoder: VorbisDecoder<&[u8]> = VorbisDecoder::new(&buf[..len])?;
+            match stream_status {
+                StreamStatus::Starting => {
+                    // let response = unsafe { std::str::from_utf8_unchecked(&buf[..recv_len]) };
+                }
+                StreamStatus::Streaming => {
+                    let mut decoder: VorbisDecoder<&[u8]> = VorbisDecoder::new(&buf[..recv_len])?;
                     while let Some(decoded_block) = decoder.decode_audio_block()? {
                         let channel1 = decoded_block.samples()[0];
                         let data_count = channel1.len();
@@ -194,10 +234,11 @@ async fn main_ex() -> Result<()> {
                         }
                     }
                 }
-                Err(e) => return Err::<(), anyhow::Error>(anyhow!("{e}")),
-            }
+                StreamStatus::Stopped => {}
+            };
         }
-        Ok(())
+
+        Ok::<(), anyhow::Error>(())
     };
 
     let config_clone = config.clone();
@@ -275,7 +316,7 @@ async fn main_ex() -> Result<()> {
     player_close_tx.send(true)?;
     player_joinh
         .join()
-        .map_err(|e| anyhow!("Could not join stream thread: {e:?}"))??;
+        .map_err(|e| anyhow!("Could not join the playback thread: {e:?}"))??;
 
     debug!("Client closed successfully");
 
