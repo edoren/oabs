@@ -1,4 +1,7 @@
-use std::{net::SocketAddr, sync::mpsc};
+use std::{
+    net::{SocketAddr, ToSocketAddrs},
+    sync::mpsc,
+};
 
 use anyhow::{anyhow, Result};
 use clap::Parser;
@@ -6,15 +9,15 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     Device,
 };
-use dialoguer::{theme::ColorfulTheme, FuzzySelect};
-use log::{debug, error, info};
+use dialoguer::{theme::ColorfulTheme, FuzzySelect, Input};
+use log::{debug, error, info, trace};
 use oabs_lib::{OABSMessage, SupportedStreamConfigDeserialize};
 use ringbuf::{
     traits::{Consumer, Producer, Split},
     HeapRb,
 };
 use tokio::{
-    io::AsyncReadExt,
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpStream, UdpSocket},
     signal,
     sync::watch,
@@ -29,18 +32,31 @@ use vorbis_rs::VorbisDecoder;
 #[command(version, about = "Client", long_about = None)]
 struct Opt {
     /// The server address to connect to
-    #[arg(short, long, value_name = "SERVER", default_value_t = String::from("127.0.0.1:48182"))]
-    server: String,
+    #[arg(short, long, value_name = "SERVER")]
+    server: Option<String>,
 
     /// Specify the delay between input and output
-    #[arg(short, long, value_name = "DELAY_MS", default_value_t = 150.0)]
-    latency: f32,
+    #[arg(short, long, value_name = "DELAY_MS")]
+    latency: Option<f32>,
 }
 
 enum StreamStatus {
     Starting,
     Streaming,
-    Stopped,
+    // Stopped,
+}
+
+async fn send_data(stream: &mut TcpStream, data: &[u8]) -> Result<()> {
+    stream.write_u16(data.len() as u16).await?;
+    stream.write_all(data).await?;
+    Ok(())
+}
+
+async fn recv_data(stream: &mut TcpStream) -> Result<Vec<u8>> {
+    let len = stream.read_u16().await?;
+    let mut bytes = vec![0u8; len as usize];
+    stream.read_exact(&mut bytes).await?;
+    Ok(bytes)
 }
 
 async fn main_ex() -> Result<()> {
@@ -83,7 +99,47 @@ async fn main_ex() -> Result<()> {
 
     // App
 
+    println!(" ██████╗  █████╗ ██████╗ ███████╗");
+    println!("██╔═══██╗██╔══██╗██╔══██╗██╔════╝");
+    println!("██║   ██║███████║██████╔╝███████╗");
+    println!("██║   ██║██╔══██║██╔══██╗╚════██║");
+    println!("╚██████╔╝██║  ██║██████╔╝███████║");
+    println!(" ╚═════╝ ╚═╝  ╚═╝╚═════╝ ╚══════╝");
+    println!("[ Open Audio Broadcast Software ]");
+    println!();
+
     let host = cpal::default_host();
+
+    let input_theme = ColorfulTheme::default();
+
+    let server_address = if let Some(server) = opt.server {
+        server
+    } else {
+        Input::with_theme(&input_theme)
+            .with_prompt("Enter the server")
+            .default(String::from("localhost:48182"))
+            .validate_with(|input: &String| -> Result<(), &str> {
+                let value = input.to_socket_addrs();
+                if let Ok(mut iter) = value {
+                    while let Some(val) = iter.next() {
+                        if val.is_ipv4() {
+                            return Ok(());
+                        }
+                    }
+                }
+                Err("This is not a valid address")
+            })
+            .interact()?
+    };
+
+    let latency = if let Some(latency) = opt.latency {
+        latency
+    } else {
+        Input::with_theme(&input_theme)
+            .with_prompt("Enter the latency")
+            .default(150.0)
+            .interact()?
+    };
 
     #[cfg(not(target_os = "android"))]
     let device = {
@@ -97,7 +153,7 @@ async fn main_ex() -> Result<()> {
             .map(|x| x.name().unwrap_or(String::new()))
             .collect::<Vec<String>>();
 
-        let selection = FuzzySelect::with_theme(&ColorfulTheme::default())
+        let selection = FuzzySelect::with_theme(&input_theme)
             .with_prompt("Select the output device")
             .default(0)
             .items(&devices_names)
@@ -111,9 +167,15 @@ async fn main_ex() -> Result<()> {
         .default_output_device()
         .ok_or(anyhow!("Could not find default output device"))?;
 
-    let remote_addr: SocketAddr = opt.server.parse()?;
+    println!();
 
-    debug!("Connecting to server {}", opt.server);
+    let remote_addr = server_address
+        .to_socket_addrs()?
+        .filter(|s| s.is_ipv4())
+        .next()
+        .ok_or(anyhow!("Could not resolve address"))?;
+
+    debug!("Connecting to server {}", server_address);
     let mut stream = TcpStream::connect(remote_addr).await?;
 
     // Wait for the socket to be readable
@@ -121,19 +183,14 @@ async fn main_ex() -> Result<()> {
 
     // Creating the buffer **after** the `await` prevents it from
     // being stored in the async task.
-    let mut buf = [0; 256];
-
     let client_id: String = loop {
-        match stream.try_read(&mut buf) {
-            Ok(n) => {
-                let value: OABSMessage = serde_json::from_slice(&buf[0..n])?;
+        match recv_data(&mut stream).await {
+            Ok(data) => {
+                let value: OABSMessage = serde_json::from_slice(&data)?;
                 if let OABSMessage::ClientId { id } = value {
                     break id;
                 }
                 return Err(anyhow!("Client id not found"));
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                continue;
             }
             Err(e) => {
                 return Err(e.into());
@@ -145,13 +202,10 @@ async fn main_ex() -> Result<()> {
     // Try to read data, this may still fail with `WouldBlock`
     // if the readiness event is a false positive.
     let config = loop {
-        match stream.try_read(&mut buf) {
-            Ok(n) => {
-                break serde_json::from_slice(&buf[0..n])
+        match recv_data(&mut stream).await {
+            Ok(data) => {
+                break serde_json::from_slice(&data)
                     .map(|SupportedStreamConfigDeserialize(dur)| dur)?;
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                continue;
             }
             Err(e) => {
                 return Err(e.into());
@@ -162,7 +216,7 @@ async fn main_ex() -> Result<()> {
     debug!("Receiving config {:?}", config);
 
     // Create a delay in case the input and output devices aren't synced.
-    let latency_frames = (opt.latency / 1_000.0) * config.sample_rate().0 as f32;
+    let latency_frames = (latency / 1_000.0) * config.sample_rate().0 as f32;
     let latency_samples = latency_frames as usize * config.channels() as usize;
 
     // The buffer to share samples
@@ -200,8 +254,7 @@ async fn main_ex() -> Result<()> {
                     cli.send(format!("START {client_id}").as_bytes()).await?;
                     stream_status = StreamStatus::Streaming;
                 }
-                StreamStatus::Streaming => {}
-                StreamStatus::Stopped => {}
+                StreamStatus::Streaming => {} // StreamStatus::Stopped => {}
             };
 
             let recv_len = tokio::select! {
@@ -230,11 +283,10 @@ async fn main_ex() -> Result<()> {
                         let data_count = channel1.len();
                         let written_count = producer.push_slice(channel1);
                         if written_count < data_count {
-                            error!("output stream fell behind: try increasing latency");
+                            trace!("output stream fell behind: try increasing latency");
                         }
                     }
-                }
-                StreamStatus::Stopped => {}
+                } // StreamStatus::Stopped => {}
             };
         }
 
@@ -252,7 +304,7 @@ async fn main_ex() -> Result<()> {
                 let received_count = data.len();
                 let read_count = consumer.pop_slice(data);
                 if read_count < received_count {
-                    error!("input stream fell behind: try increasing latency");
+                    trace!("input stream fell behind: try increasing latency");
                 }
             },
             err_fn,
@@ -276,14 +328,35 @@ async fn main_ex() -> Result<()> {
         Ok(())
     };
 
-    debug!("{config:?}");
+    let server_receiver = async move {
+        loop {
+            if let Ok(data) = recv_data(&mut stream).await {
+                let value = unsafe { std::str::from_utf8_unchecked(&data) };
+                if value == "PING" {
+                    trace!("YAAAAAS PING");
+                    loop {
+                        if let Ok(_) = send_data(&mut stream, "PONG".as_bytes()).await {
+                            break;
+                        }
+                    }
+                }
+                if value == "CLOSE" {
+                    trace!("Server requested close");
+                    break;
+                }
+            }
+        }
+    };
 
     let stream_receiver_joinh = tokio::spawn(stream_receiver_task);
     let player_joinh = std::thread::spawn(player_task);
 
     #[cfg(not(target_os = "windows"))]
     {
-        signal::ctrl_c().await?;
+        tokio::select! {
+            _ = signal::ctrl_c() => { },
+            _ = server_receiver => { }
+        };
     }
     #[cfg(target_os = "windows")]
     {
@@ -298,13 +371,7 @@ async fn main_ex() -> Result<()> {
             _ = ctrl_break_signal.recv() => { },
             _ = ctrl_logoff_signal.recv() => { },
             _ = ctrl_shutdown_signal.recv() => { },
-            result = stream.read_i32() => {
-                if let Ok(result) = result {
-                    if result == -1 {
-                        debug!("Server closed");
-                    }
-                }
-             }
+            _ = server_receiver => { }
         };
     }
 

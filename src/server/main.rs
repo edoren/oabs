@@ -1,11 +1,12 @@
 use std::{
     collections::HashMap,
-    net::SocketAddr,
+    net::{Ipv4Addr, SocketAddr},
     num::{NonZeroU32, NonZeroU8},
     sync::{
         atomic::{AtomicUsize, Ordering},
         mpsc::{self, Receiver},
     },
+    time::Duration,
 };
 
 use anyhow::{anyhow, Result};
@@ -15,7 +16,7 @@ use cpal::{
     Device, SampleFormat, SampleRate, SupportedStreamConfig,
 };
 use dialoguer::{theme::ColorfulTheme, FuzzySelect};
-use log::{debug, error};
+use log::{debug, error, trace};
 use oabs_lib::{OABSMessage, SupportedStreamConfigSerialize};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -23,6 +24,7 @@ use tokio::{
     signal,
     sync::watch,
     task::{yield_now, JoinSet},
+    time::{timeout_at, Instant},
 };
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{
@@ -33,6 +35,19 @@ use vorbis_rs::VorbisEncoderBuilder;
 enum ClientStatus {
     Connected { id: String },
     Disconnected { id: String },
+}
+
+async fn send_data(stream: &mut TcpStream, data: &[u8]) -> Result<()> {
+    stream.write_u16(data.len() as u16).await?;
+    stream.write_all(data).await?;
+    Ok(())
+}
+
+async fn recv_data(stream: &mut TcpStream) -> Result<Vec<u8>> {
+    let len = stream.read_u16().await?;
+    let mut bytes = vec![0u8; len as usize];
+    stream.read_exact(&mut bytes).await?;
+    Ok(bytes)
 }
 
 #[derive(Parser, Debug)]
@@ -57,26 +72,23 @@ fn get_id() -> usize {
 }
 
 async fn client_handler(
-    mut socket: TcpStream,
+    mut stream: TcpStream,
     config: SupportedStreamConfig,
     mut close_rx: watch::Receiver<bool>,
     client_status_tx: tokio::sync::mpsc::Sender<ClientStatus>,
 ) -> Result<()> {
     let client_id = get_id().to_string();
+    let address = stream.peer_addr()?;
 
-    debug!(
-        "Sending to {:?} payload {:?}",
-        socket.peer_addr()?,
-        client_id
-    );
-    let someting = serde_json::to_vec(&OABSMessage::ClientId {
+    debug!("Sending to {:?} payload {:?}", address, client_id);
+    let client_id_msg = serde_json::to_vec(&OABSMessage::ClientId {
         id: client_id.clone(),
     })?;
-    socket.write(&someting).await?;
+    send_data(&mut stream, &client_id_msg).await?;
 
-    debug!("Sending to {:?} payload {:?}", socket.peer_addr()?, config);
+    debug!("Sending to {:?} payload {:?}", address, config);
     let value = serde_json::to_vec(&SupportedStreamConfigSerialize(&config))?;
-    socket.write(&value).await?;
+    send_data(&mut stream, &value).await?;
 
     let _ = client_status_tx
         .send(ClientStatus::Connected {
@@ -84,25 +96,51 @@ async fn client_handler(
         })
         .await;
 
-    let client_id_cloned = client_id.clone();
-    tokio::select! {
-        _ = async move {
-            loop {
-                let mut buf = [];
+    let client_task = async {
+        loop {
+            let pong_instant = Instant::now() + Duration::from_secs(10);
+            match send_data(&mut stream, "PING".as_bytes()).await {
+                Ok(_) => {}
+                Err(_) => todo!(),
+            }
 
-                match socket.read(&mut buf).await {
-                    Ok(0) | Err(_)
-                     => {
-                        // TODO: PING
-                        let _ = client_status_tx.send(ClientStatus::Disconnected { id: client_id_cloned }).await;
+            let read_result = match timeout_at(pong_instant, recv_data(&mut stream)).await {
+                Ok(result) => result,
+                Err(_) => {
+                    break;
+                }
+            };
+
+            match read_result {
+                Err(_) => {
+                    break;
+                }
+                Ok(data) => {
+                    if data.len() == 0 {
+                        debug!("Empty data frame for client {client_id}. Closing.");
                         break;
-                    },
-                    _ => {}
+                    }
+                    let value = unsafe { std::str::from_utf8_unchecked(&data) };
+                    if value == "PONG" {
+                        trace!("YAAAAAS PONG");
+                    }
                 }
             }
-        } => {},
+        }
+    };
+
+    tokio::select! {
+        _ = client_task => {},
         _ = close_rx.changed() => {}
     };
+
+    let _ = send_data(&mut stream, "CLOSE".as_bytes()).await;
+
+    let _ = client_status_tx
+        .send(ClientStatus::Disconnected {
+            id: client_id.clone(),
+        })
+        .await;
 
     debug!("Client closed with id: {client_id}");
 
@@ -119,9 +157,9 @@ async fn payload_server(
 
     let listener = TcpListener::bind(server_addr).await?;
     debug!("Payload server listening on: {}", listener.local_addr()?);
-    let mut sockets = JoinSet::new();
+    let mut streams = JoinSet::new();
     loop {
-        let socket = tokio::select! {
+        let stream = tokio::select! {
             result = listener.accept() => {
                 result?.0
             },
@@ -132,15 +170,15 @@ async fn payload_server(
                 continue;
             }
         };
-        sockets.spawn(client_handler(
-            socket,
+        streams.spawn(client_handler(
+            stream,
             config.clone(),
             close_rx.clone(),
             client_status_tx.clone(),
         ));
     }
 
-    while let Some(_res) = sockets.join_next().await {}
+    while let Some(_res) = streams.join_next().await {}
 
     debug!("Stopping Payload Server");
     Ok(())
@@ -249,30 +287,32 @@ async fn main() -> Result<()> {
 
     // App
 
-    let server_addr = SocketAddr::new("0.0.0.0".parse()?, opt.port);
-
+    let server_addr = SocketAddr::new(Ipv4Addr::new(0, 0, 0, 0).into(), opt.port);
     let host = cpal::default_host();
 
-    let input_devices: Vec<Device> = host.input_devices()?.filter(|x| x.name().is_ok()).collect();
+    #[cfg(not(target_os = "android"))]
+    let device = {
+        let input_devices: Vec<Device> =
+            host.input_devices()?.filter(|x| x.name().is_ok()).collect();
 
-    let devices_names = input_devices
-        .iter()
-        .map(|x| x.name().unwrap_or(String::new()))
-        .collect::<Vec<String>>();
+        let devices_names = input_devices
+            .iter()
+            .map(|x| x.name().unwrap_or(String::new()))
+            .collect::<Vec<String>>();
 
-    let selection = FuzzySelect::with_theme(&ColorfulTheme::default())
-        .with_prompt("Select the device to capture")
-        .items(&devices_names)
-        .interact()?;
+        let selection = FuzzySelect::with_theme(&ColorfulTheme::default())
+            .with_prompt("Select the device to capture")
+            .default(0)
+            .items(&devices_names)
+            .interact()?;
 
-    let selected_name = &devices_names[selection];
+        input_devices[selection].clone()
+    };
 
-    let device = input_devices
-        .into_iter()
-        .find(|p| p.name().is_ok_and(|n| &n == selected_name))
-        .ok_or(anyhow!(
-            "Selected device {selected_name:?} could not be found"
-        ))?;
+    #[cfg(target_os = "android")]
+    let device = host
+        .default_input_device()
+        .ok_or(anyhow!("Could not find default input device"))?;
 
     let configs = device
         .supported_input_configs()?
