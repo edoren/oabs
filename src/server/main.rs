@@ -110,7 +110,7 @@ async fn client_handler(
             let pong_instant = Instant::now() + Duration::from_secs(10);
             match send_data(&mut stream, "PING".as_bytes()).await {
                 Ok(_) => {
-                    debug!("Sending PING to client {client_id:?}")
+                    trace!("Sending PING to client {client_id:?}")
                 }
                 Err(e) => {
                     error!("Error sending PING {e:?}")
@@ -230,7 +230,7 @@ async fn stream_server(
     unsafe {
         vorbis_info_init(vi.as_mut_ptr());
 
-        let ret = vorbis_encode_init_vbr(vi.as_mut_ptr(), channels as i32, sample_rate as i32, 0.5);
+        let ret = vorbis_encode_init_vbr(vi.as_mut_ptr(), channels as i32, sample_rate as i32, 1.0);
         if ret != 0 {
             panic!("YAY");
         }
@@ -277,9 +277,6 @@ async fn stream_server(
     }
 
     info!("Header Data: {}", header_data.len());
-    for data in &header_data[..10] {
-        println!("{:X?}", data);
-    }
 
     let mut buffer = [0; 8];
     let mut encoded_data: Vec<u8> = Vec::new();
@@ -346,12 +343,8 @@ async fn stream_server(
                 let channel_samples: &Vec<f32> = channel_samples.as_ref();
                 if channel_samples.len() != sample_count {
                     panic!("PUTA MADRE");
-                    // return Err(anyhow!("PUTA MADRE"));
                 }
 
-                // SAFETY: both the source and destination locations are valid.
-                // They do not overlap each other because they belong to different
-                // memory allocations
                 unsafe {
                     channel_samples
                         .as_ptr()
@@ -407,11 +400,11 @@ async fn stream_server(
             }
         }
 
+        println!("{} {}", encoded_data.len(), audio_block[0].len());
+
         if encoded_data.is_empty() {
             continue;
         }
-
-        println!("Encoded Data: {}", encoded_data.len());
 
         for source in registered_clients.values() {
             if let Some(source) = source {
@@ -512,7 +505,7 @@ async fn main() -> Result<()> {
         .supported_input_configs()?
         .filter(|c| c.sample_format() == SampleFormat::F32)
         .filter_map(|c| {
-            c.try_with_sample_rate(SampleRate(44100))
+            c.try_with_sample_rate(SampleRate(48000))
                 .or(c.try_with_sample_rate(c.min_sample_rate()))
         })
         .collect::<Vec<SupportedStreamConfig>>();

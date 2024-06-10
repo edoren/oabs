@@ -27,8 +27,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpStream, UdpSocket},
     signal,
-    sync::watch,
-    time::sleep,
+    sync::{mpsc, watch}
 };
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{
@@ -66,68 +65,24 @@ async fn recv_data(stream: &mut TcpStream) -> Result<Vec<u8>> {
 }
 
 async fn decoder_task(
-    source: Caching<Arc<SharedRb<Heap<u8>>>, false, true>,
+    mut data_receiver: mpsc::Receiver<Vec<u8>>,
     mut producer: Caching<Arc<SharedRb<Heap<f32>>>, true, false>,
     mut close_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     info!("Starting Decoder Task");
 
-    while source.occupied_len() == 0 {
-        sleep(Duration::from_millis(100)).await;
-    }
-
-    // println!("Ocupado {}", source.occupied_len());
-
-    // let mut oy: Box<MaybeUninit<ogg_sync_state>> = Box::new(MaybeUninit::uninit());
-    // let mut os: Box<MaybeUninit<ogg_stream_state>> = Box::new(MaybeUninit::uninit());
-
-    // let mut og: Box<MaybeUninit<ogg_page>> = Box::new(MaybeUninit::uninit());
-    // let mut op: Box<MaybeUninit<ogg_packet>> = Box::new(MaybeUninit::uninit());
-
-    // let mut vi: Box<MaybeUninit<vorbis_info>> = Box::new(MaybeUninit::uninit());
-
-    // let mut vc: Box<MaybeUninit<vorbis_comment>> = Box::new(MaybeUninit::uninit());
-    // let mut vd: Box<MaybeUninit<vorbis_dsp_state>> = Box::new(MaybeUninit::uninit());
-    // let mut vb: Box<MaybeUninit<vorbis_block>> = Box::new(MaybeUninit::uninit());
-
-    // unsafe {
-    //     ogg_sync_init(oy.as_mut_ptr());
-
-    //     // loop {
-    //     let mut buffer =
-    //         std::slice::from_raw_parts_mut(ogg_sync_buffer(oy.as_mut_ptr(), 8192).cast(), 8192);
-    //     let bytes = source.pop_slice(buffer);
-
-    //     println!("buffer {}", bytes);
-
-    //     for data in &buffer[..10] {
-    //         println!("{:X?}", data);
-    //     }
-
-    //     println!(
-    //         "ogg_sync_wrote {}",
-    //         ogg_sync_wrote(oy.as_mut_ptr(), bytes as i32)
-    //     );
-
-    //     let ret = ogg_sync_pageout(oy.as_mut_ptr(), og.as_mut_ptr());
-    //     if ret != 1 {
-    //         /* have we simply run out of data?  If so, we're done. */
-    //         if bytes < 4096 {
-    //             return Ok::<(), anyhow::Error>(());
-    //         };
-
-    //         /* error case.  Must not be Vorbis data */
-    //         eprintln!("Input does not appear to be an Ogg bitstream. {ret}");
-    //     }
-
-    //     // ogg_stream_init(os.as_mut_ptr(), ogg_page_serialno(og.as_mut_ptr()));
-
-    //     // }
-    // }
+    let decode_ring = HeapRb::<u8>::new(5400);
+    let (mut decode_producer, decode_consumer) = decode_ring.split();
 
     let mut vf: Box<MaybeUninit<OggVorbis_File>> = Box::new(MaybeUninit::uninit());
+    let source = Box::into_raw(decode_consumer.into());
 
-    let source = Box::into_raw(source.into());
+    // Await for the header and
+    if let Some(data) = data_receiver.recv().await {
+        decode_producer.push_slice(&data);
+    } else {
+        return Err(anyhow!("Error obtaining header"));
+    }
 
     unsafe {
         let callbacks = ov_callbacks {
@@ -202,87 +157,56 @@ async fn decoder_task(
             }
         }
 
+        if let Some(data) = data_receiver.recv().await {
+            decode_producer.push_slice(&data);
+        } else {
+            if data_receiver.is_closed() {
+                break;
+            }
+            continue;
+        }
+
         let mut current_bitstream = Box::new(MaybeUninit::uninit());
         let mut sample_buf = Box::new(MaybeUninit::uninit());
 
-        // SAFETY: we assume ov_read_float follows its documented contract. See the
-        // VorbisAudioSamples implementation for more safety information
         unsafe {
-            let samples_read = ov_read_float(
-                vf.as_mut_ptr(),
-                sample_buf.as_mut_ptr(),
-                1024, // Most stereo Ogg Vorbis files in the wild use a maximum block size of 2048 samples
-                current_bitstream.as_mut_ptr(),
-            );
+            loop {
+                let samples_read = ov_read_float(
+                    vf.as_mut_ptr(),
+                    sample_buf.as_mut_ptr(),
+                    2048,
+                    current_bitstream.as_mut_ptr(),
+                );
 
-            if samples_read < 0 {
-                continue;
-            }
-            if samples_read == 0 {
-                continue;
-            }
-
-            if samples_read > 0 {
-                // This is not documented, but we can only assume the current bitstream number was
-                // initialized if we read some sample; else, ov_read_float may not write to
-                // current_bitstream. Read the ov_read_float source code
-                if current_bitstream.assume_init_read() != 0 {
-                    return Err(anyhow!("VorbisError::UnsupportedStreamChaining"));
+                if samples_read <= 0 {
+                    // debug!("Decode EOF reached");
+                    break;
                 }
 
-                let buf: *mut *mut f32 = sample_buf.assume_init_read();
-                let samples_read = samples_read as usize;
-                let channels = (*vf.assume_init_ref().vi).channels as usize;
+                if samples_read > 0 {
+                    if current_bitstream.assume_init_read() != 0 {
+                        return Err(anyhow!("VorbisError::UnsupportedStreamChaining"));
+                    }
 
-                let mut values =
-                    std::slice::from_raw_parts(buf, channels)
-                        .iter()
-                        .map(|channel_samples| {
-                            std::slice::from_raw_parts(*channel_samples, samples_read)
-                        });
+                    let buf: *mut *mut f32 = sample_buf.assume_init_read();
+                    let samples_read = samples_read as usize;
+                    let channels = (*vf.assume_init_ref().vi).channels as usize;
 
-                let channel1 = values.next().unwrap();
-                producer.push_slice(channel1);
+                    let mut values =
+                        std::slice::from_raw_parts(buf, channels)
+                            .iter()
+                            .map(|channel_samples| {
+                                std::slice::from_raw_parts(*channel_samples, samples_read)
+                            });
 
-                // Ok(self.last_audio_block.as_ref())
-            } else {
-                // Ok(None)
+                    let channel1 = values.next().unwrap();
+                    producer.push_slice(channel1);
+                } else {
+                    // Ok(None)
+                }
             }
         }
     }
-
-    // println!("Data 0");
-
-    // let mut decoder = VorbisDecoder::new(source);
-
-    // let mut decoder = if let Err(e) = decoder {
-    //     info!("TAMARE {e:?}");
-    //     return Err(anyhow!("TARAME"));
-    // } else {
-    //     decoder.unwrap()
-    // };
-
-    // loop {
-    //     if let Ok(changed) = close_rx.has_changed() {
-    //         if changed && *close_rx.borrow_and_update() {
-    //             break;
-    //         }
-    //     }
-
-    //     let result = decoder.decode_audio_block();
-    //     if let
-
-    //     println!("Data 1 {:?}", result.is_none());
-    //     if let Some(decoded_block) = result {
-    //         let channel1 = decoded_block.samples()[0];
-    //         let data_count = channel1.len();
-    //         println!("DATA 2 {data_count}");
-    //         // let written_count = producer.push_slice(channel1);
-    //         // if written_count < data_count {
-    //         //     trace!("output stream fell behind: try increasing latency");
-    //         // }
-    //     }
-    // }
 
     unsafe {
         ov_clear(vf.as_mut_ptr());
@@ -456,8 +380,7 @@ async fn main_ex() -> Result<()> {
     let ring = HeapRb::<f32>::new(latency_samples * 2);
     let (mut producer, mut consumer) = ring.split();
 
-    let decode_ring = HeapRb::<u8>::new(latency_samples * 2 * 10);
-    let (mut decode_producer, decode_consumer) = decode_ring.split();
+    info!("Latency Samples: {latency_samples}");
 
     // Fill the samples with 0.0 equal to the length of the delay.
     for _ in 0..latency_samples {
@@ -469,6 +392,7 @@ async fn main_ex() -> Result<()> {
     }
 
     let (close_tx, close_rx) = watch::channel(false);
+    let (data_obtained_tx, data_obtained_rx) = mpsc::channel(50);
 
     let err_fn = move |err| {
         error!("an error occurred on stream: {}", err);
@@ -511,23 +435,17 @@ async fn main_ex() -> Result<()> {
 
             match stream_status {
                 StreamStatus::Starting => {
-                    // let response = unsafe { std::str::from_utf8_unchecked(&buf[..recv_len]) };
-                    // println!("Header {recv_len} bytes");
-                    decode_producer.push_slice(&buf[..recv_len]);
+                    let res = data_obtained_tx.send(buf[..recv_len].to_vec()).await;
+                    if let Err(e) = res {
+                        error!("Could not send data to decode: {e:?}");
+                    }
                     stream_status = StreamStatus::Streaming;
                 }
                 StreamStatus::Streaming => {
-                    // println!("Received {recv_len} bytes");
-                    decode_producer.push_slice(&buf[..recv_len]);
-                    // let mut decoder: VorbisDecoder<&[u8]> = VorbisDecoder::new(&buf[..recv_len])?;
-                    // while let Some(decoded_block) = decoder.decode_audio_block()? {
-                    //     let channel1 = decoded_block.samples()[0];
-                    //     let data_count = channel1.len();
-                    //     let written_count = producer.push_slice(channel1);
-                    //     if written_count < data_count {
-                    //         trace!("output stream fell behind: try increasing latency");
-                    //     }
-                    // }
+                    let res = data_obtained_tx.send(buf[..recv_len].to_vec()).await;
+                    if let Err(e) = res {
+                        error!("Could not send data to decode: {e:?}");
+                    }
                 } // StreamStatus::Stopped => {}
             };
         }
@@ -578,14 +496,13 @@ async fn main_ex() -> Result<()> {
         loop {
             if let Ok(data) = recv_data(&mut stream).await {
                 let value = unsafe { std::str::from_utf8_unchecked(&data) };
-                debug!("YAAAAAS VALUE {value}");
                 if value == "PING" {
-                    debug!("YAAAAAS PING");
+                    trace!("PING");
                     loop {
                         if let Err(e) = send_data(&mut stream, "PONG".as_bytes()).await {
-                            debug!("ERROR SENDING PONG: {e:?}");
+                            debug!("Error Sending Pong: {e:?}");
                         } else {
-                            debug!("YAAAAAS PONG");
+                            trace!("PONG");
                             break;
                         }
                     }
@@ -630,29 +547,27 @@ async fn main_ex() -> Result<()> {
     };
 
     let close_joinh = tokio::spawn(close_task);
-    let decoder_joinh = tokio::spawn(decoder_task(
-        decode_consumer,
-        producer,
-        close_rx.clone(),
-    ));
+    let stream_receiver_joinh = tokio::spawn(stream_receiver_task);
 
-    let local = tokio::task::LocalSet::new();
-    let stream_joinh = local.spawn_local(player_task);
-    let stream_receiver_joinh = local.spawn_local(stream_receiver_task);
-    local.await;
+    let (close_res, player_res, stream_receiver_res, decoder_res) = tokio::join!(
+        close_joinh,
+        player_task,
+        stream_receiver_joinh,
+        decoder_task(data_obtained_rx, producer, close_rx.clone())
+    );
 
-    if let Err(e) = decoder_joinh.await? {
+    if let Err(e) = decoder_res {
         error!("{e:?}");
     };
-    if let Err(e) = close_joinh.await? {
+    if let Err(e) = close_res {
         error!("{e:?}");
     };
-    // if let Err(e) = stream_joinh.await? {
-    //     error!("{e:?}");
-    // };
-    // if let Err(e) = stream_receiver_joinh.await? {
-    //     error!("{e:?}");
-    // };
+    if let Err(e) = player_res {
+        error!("{e:?}");
+    };
+    if let Err(e) = stream_receiver_res {
+        error!("{e:?}");
+    };
 
     debug!("Client closed successfully");
 
