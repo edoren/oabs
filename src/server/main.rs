@@ -1,36 +1,45 @@
 use std::{
     collections::HashMap,
+    io::Write,
+    mem::MaybeUninit,
     net::{Ipv4Addr, SocketAddr},
     num::{NonZeroU32, NonZeroU8},
+    slice,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        mpsc::{self, Receiver},
+        // mpsc::{self, Receiver},
     },
     time::Duration,
 };
 
 use anyhow::{anyhow, Result};
+use aotuv_lancer_vorbis_sys::*;
 use clap::Parser;
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     Device, SampleFormat, SampleRate, SupportedStreamConfig,
 };
 use dialoguer::{theme::ColorfulTheme, FuzzySelect};
-use log::{debug, error, trace};
+use log::{debug, error, info, trace};
 use oabs_lib::{OABSMessage, SupportedStreamConfigSerialize};
+use ogg_next_sys::*;
+use rand::Rng;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
     signal,
-    sync::watch,
+    sync::{
+        mpsc::{self, Receiver, UnboundedReceiver},
+        watch,
+    },
     task::{yield_now, JoinSet},
-    time::{timeout_at, Instant},
+    time::{sleep, timeout_at, Instant},
 };
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{
     filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
 };
-use vorbis_rs::VorbisEncoderBuilder;
+use vorbis_rs::{VorbisEncoderBuilder, VorbisError};
 
 enum ClientStatus {
     Connected { id: String },
@@ -100,13 +109,18 @@ async fn client_handler(
         loop {
             let pong_instant = Instant::now() + Duration::from_secs(10);
             match send_data(&mut stream, "PING".as_bytes()).await {
-                Ok(_) => {}
-                Err(_) => todo!(),
+                Ok(_) => {
+                    debug!("Sending PING to client {client_id:?}")
+                }
+                Err(e) => {
+                    error!("Error sending PING {e:?}")
+                }
             }
 
             let read_result = match timeout_at(pong_instant, recv_data(&mut stream)).await {
                 Ok(result) => result,
-                Err(_) => {
+                Err(e) => {
+                    error!("Error receiving PONG {e:?}");
                     break;
                 }
             };
@@ -126,6 +140,8 @@ async fn client_handler(
                     }
                 }
             }
+
+            sleep(Duration::from_secs(5)).await;
         }
     };
 
@@ -151,7 +167,7 @@ async fn payload_server(
     server_addr: SocketAddr,
     config: SupportedStreamConfig,
     mut close_rx: watch::Receiver<bool>,
-    client_status_tx: tokio::sync::mpsc::Sender<ClientStatus>,
+    client_status_tx: mpsc::Sender<ClientStatus>,
 ) -> Result<()> {
     debug!("Starting Payload Server");
 
@@ -186,18 +202,89 @@ async fn payload_server(
 
 async fn stream_server(
     server_addr: SocketAddr,
-    data_send_rx: Receiver<Vec<u8>>,
+    mut data_send_rx: mpsc::UnboundedReceiver<Vec<f32>>,
     mut close_rx: watch::Receiver<bool>,
-    mut client_status_rx: tokio::sync::mpsc::Receiver<ClientStatus>,
+    mut client_status_rx: mpsc::Receiver<ClientStatus>,
 ) -> Result<()> {
     debug!("Starting Stream Server");
 
     let sock = UdpSocket::bind(server_addr).await?;
     debug!("Stream server listening on: {}", sock.local_addr()?);
 
+    let sample_rate = 48000;
+    let channels = 1;
+
+    let mut header_data: Vec<u8> = Vec::new();
+    let serial_num = rand::thread_rng().gen();
+    debug!("Serial: {}", serial_num);
+
+    let mut os: Box<MaybeUninit<ogg_stream_state>> = Box::new(MaybeUninit::uninit());
+    let mut og: Box<MaybeUninit<ogg_page>> = Box::new(MaybeUninit::uninit());
+    let mut op: Box<MaybeUninit<ogg_packet>> = Box::new(MaybeUninit::uninit());
+
+    let mut vi: Box<MaybeUninit<vorbis_info>> = Box::new(MaybeUninit::uninit());
+    let mut vc: Box<MaybeUninit<vorbis_comment>> = Box::new(MaybeUninit::uninit());
+    let mut vd: Box<MaybeUninit<vorbis_dsp_state>> = Box::new(MaybeUninit::uninit());
+    let mut vb: Box<MaybeUninit<vorbis_block>> = Box::new(MaybeUninit::uninit());
+
+    unsafe {
+        vorbis_info_init(vi.as_mut_ptr());
+
+        let ret = vorbis_encode_init_vbr(vi.as_mut_ptr(), channels as i32, sample_rate as i32, 0.5);
+        if ret != 0 {
+            panic!("YAY");
+        }
+
+        vorbis_comment_init(vc.as_mut_ptr());
+        // vorbis_comment_add_tag(vc.as_mut_ptr(), "ENCODER","encoder_example.c");
+
+        vorbis_analysis_init(vd.as_mut_ptr(), vi.as_mut_ptr());
+        vorbis_block_init(vd.as_mut_ptr(), vb.as_mut_ptr());
+
+        ogg_stream_init(os.as_mut_ptr(), serial_num);
+
+        {
+            let mut header = Box::new(MaybeUninit::uninit());
+            let mut header_comm = Box::new(MaybeUninit::uninit());
+            let mut header_code = Box::new(MaybeUninit::uninit());
+
+            vorbis_analysis_headerout(
+                vd.as_mut_ptr(),
+                vc.as_mut_ptr(),
+                header.as_mut_ptr(),
+                header_comm.as_mut_ptr(),
+                header_code.as_mut_ptr(),
+            );
+            ogg_stream_packetin(os.as_mut_ptr(), header.as_mut_ptr());
+            ogg_stream_packetin(os.as_mut_ptr(), header_comm.as_mut_ptr());
+            ogg_stream_packetin(os.as_mut_ptr(), header_code.as_mut_ptr());
+
+            /* This ensures the actual
+             * audio data will start on a new page, as per spec
+             */
+            while ogg_stream_flush(os.as_mut_ptr(), og.as_mut_ptr()) != 0 {
+                let ogg_page = og.assume_init_ref();
+                header_data.extend_from_slice(slice::from_raw_parts(
+                    ogg_page.header,
+                    ogg_page.header_len as usize,
+                ));
+                header_data.extend_from_slice(slice::from_raw_parts(
+                    ogg_page.body,
+                    ogg_page.body_len as usize,
+                ));
+            }
+        }
+    }
+
+    info!("Header Data: {}", header_data.len());
+    for data in &header_data[..10] {
+        println!("{:X?}", data);
+    }
+
     let mut buffer = [0; 8];
+    let mut encoded_data: Vec<u8> = Vec::new();
     let mut registered_clients: HashMap<String, Option<SocketAddr>> = HashMap::new();
-    loop {
+    'stream_loop: loop {
         if let Ok(changed) = close_rx.has_changed() {
             if changed && *close_rx.borrow_and_update() {
                 break;
@@ -222,24 +309,127 @@ async fn stream_server(
                 let id = msg.split(" ").nth(1).unwrap();
                 registered_clients.insert(id.into(), Some(source));
                 debug!("Added interested {source} with id {id}");
+                let _len = sock.send_to(&header_data, source).await?;
             }
         }
 
-        let samples = loop {
-            let result = data_send_rx.recv();
-            if let Ok(data) = result {
+        let raw_samples: Vec<f32> = loop {
+            let result = data_send_rx.recv().await;
+            if let Some(data) = result {
                 break data;
+            }
+            if data_send_rx.is_closed() {
+                break 'stream_loop;
             }
             yield_now().await;
         };
 
-        for source in registered_clients.values() {
-            if let Some(source) = source {
-                let _len = sock.send_to(&samples, source).await?;
+        // if registered_clients.is_empty() {
+        //     continue;
+        // }
+
+        let audio_block = [raw_samples];
+
+        {
+            let sample_count = audio_block[0].len();
+            let encoder_buffer = unsafe {
+                let audio_channels = vi.assume_init_ref().channels as usize;
+                slice::from_raw_parts_mut(
+                    vorbis_analysis_buffer(vd.as_mut_ptr(), sample_count.try_into()?),
+                    audio_channels,
+                )
+            };
+
+            for (channel_samples, channel_encode_buffer) in
+                audio_block.iter().zip(encoder_buffer.iter_mut())
+            {
+                let channel_samples: &Vec<f32> = channel_samples.as_ref();
+                if channel_samples.len() != sample_count {
+                    panic!("PUTA MADRE");
+                    // return Err(anyhow!("PUTA MADRE"));
+                }
+
+                // SAFETY: both the source and destination locations are valid.
+                // They do not overlap each other because they belong to different
+                // memory allocations
+                unsafe {
+                    channel_samples
+                        .as_ptr()
+                        .copy_to_nonoverlapping(*channel_encode_buffer, sample_count);
+                }
+            }
+
+            let res = unsafe { vorbis_analysis_wrote(vd.as_mut_ptr(), sample_count as i32) };
+            if res != 0 {
+                panic!("FUCK ERROR WRITE");
+            }
+
+            // SAFETY: we assume the functions inside this unsafe block follow their
+            // documented contract
+            unsafe {
+                while vorbis_analysis_blockout(vd.as_mut_ptr(), vb.as_mut_ptr()) == 1 {
+                    let res = vorbis_analysis(vb.as_mut_ptr(), std::ptr::null_mut());
+                    if res != 0 {
+                        panic!("FUCK ERROR WRITE");
+                    }
+                    let res = vorbis_bitrate_addblock(vb.as_mut_ptr());
+                    if res != 0 {
+                        panic!("FUCK ERROR WRITE");
+                    }
+
+                    while vorbis_bitrate_flushpacket(vd.as_mut_ptr(), op.as_mut_ptr()) == 1 {
+                        let res = ogg_stream_packetin(os.as_mut_ptr(), op.as_mut_ptr());
+                        if res != 0 {
+                            panic!("FUCK ERROR WRITE");
+                        }
+
+                        while ogg_stream_pageout(os.as_mut_ptr(), og.as_mut_ptr()) != 0 {
+                            let ogg_page = og.assume_init_ref();
+                            encoded_data.extend_from_slice(slice::from_raw_parts(
+                                ogg_page.header,
+                                ogg_page.header_len as usize,
+                            ));
+                            encoded_data.extend_from_slice(slice::from_raw_parts(
+                                ogg_page.body,
+                                ogg_page.body_len as usize,
+                            ));
+
+                            /* this could be set above, but for illustrative purposes, I do
+                            it here (to show that vorbis does know where the stream ends) */
+
+                            if ogg_page_eos(ogg_page) > 0 {
+                                println!("EROR D:");
+                                break 'stream_loop;
+                            };
+                        }
+                    }
+                }
             }
         }
 
+        if encoded_data.is_empty() {
+            continue;
+        }
+
+        println!("Encoded Data: {}", encoded_data.len());
+
+        for source in registered_clients.values() {
+            if let Some(source) = source {
+                let _len = sock.send_to(&encoded_data, source).await?;
+            }
+        }
+
+        encoded_data.clear();
+
         yield_now().await;
+    }
+
+    unsafe {
+        ogg_stream_clear(os.as_mut_ptr());
+        vorbis_block_clear(vb.as_mut_ptr());
+        vorbis_dsp_clear(vd.as_mut_ptr());
+        vorbis_comment_clear(vc.as_mut_ptr());
+        vorbis_info_clear(vi.as_mut_ptr());
     }
 
     debug!("Stopping Stream Server");
@@ -300,11 +490,15 @@ async fn main() -> Result<()> {
             .map(|x| x.name().unwrap_or(String::new()))
             .collect::<Vec<String>>();
 
-        let selection = FuzzySelect::with_theme(&ColorfulTheme::default())
-            .with_prompt("Select the device to capture")
-            .default(0)
-            .items(&devices_names)
-            .interact()?;
+        // let selection = FuzzySelect::with_theme(&ColorfulTheme::default())
+        //     .with_prompt("Select the device to capture")
+        //     .default(0)
+        //     .items(&devices_names)
+        //     .interact()?;
+
+        let selection = 0;
+
+        println!("{}", devices_names[selection]);
 
         input_devices[selection].clone()
     };
@@ -330,9 +524,8 @@ async fn main() -> Result<()> {
     // Run the input stream on a separate thread.
 
     let (close_tx, close_rx) = watch::channel(false);
-    let (stream_close_tx, stream_close_rx) = mpsc::channel();
-    let (data_send_tx, data_send_rx) = mpsc::channel();
-    let (client_status_tx, client_status_rx) = tokio::sync::mpsc::channel::<ClientStatus>(100);
+    let (data_send_tx, data_send_rx) = mpsc::unbounded_channel::<Vec<_>>();
+    let (client_status_tx, client_status_rx) = mpsc::channel::<ClientStatus>(100);
 
     debug!("Sample Format {:?}", config.sample_format());
 
@@ -341,27 +534,17 @@ async fn main() -> Result<()> {
     };
 
     let config_clone = config.clone();
-    let stream_thread = std::thread::spawn(move || -> Result<()> {
+    let mut stream_close_rx = close_rx.clone();
+    let playback_capturer_task = async move {
         let stream = device.build_input_stream(
             &config_clone.into(),
             move |data: &[f32], _| {
-                let mut encoded_data: Vec<u8> = Vec::new();
-                let sampling_frequency = NonZeroU32::new(48000).ok_or(anyhow!("WUT")).unwrap();
-                let channels = NonZeroU8::new(1).ok_or(anyhow!("WUT")).unwrap();
-                {
-                    let mut encoder =
-                        VorbisEncoderBuilder::new(sampling_frequency, channels, &mut encoded_data)
-                            .unwrap()
-                            .build()
-                            .unwrap();
-                    let encode_result = encoder.encode_audio_block([data]);
-                    if let Err(err) = encode_result {
-                        error!("Encoding Error: {err:?}")
-                    }
-                }
                 let mut samples = Vec::new();
                 samples.extend_from_slice(&data);
-                let _ = data_send_tx.send(encoded_data);
+                let res = data_send_tx.send(data.to_vec());
+                if let Err(e) = res {
+                    println!("{e:?}");
+                }
             },
             err_fn,
             None,
@@ -370,9 +553,10 @@ async fn main() -> Result<()> {
         debug!("Begin recording");
         stream.play()?;
         loop {
-            if stream_close_rx.recv()? {
-                debug!("Closing stream thread");
-                break;
+            if let Ok(_) = stream_close_rx.changed().await {
+                if *stream_close_rx.borrow_and_update() {
+                    break;
+                }
             }
         }
         stream.pause()?;
@@ -380,28 +564,18 @@ async fn main() -> Result<()> {
 
         drop(stream);
 
-        Ok(())
-    });
-
-    let stream_joinh = tokio::spawn(stream_server(
-        server_addr,
-        data_send_rx,
-        close_rx.clone(),
-        client_status_rx,
-    ));
-    let payload_joinh = tokio::spawn(payload_server(
-        server_addr,
-        config.clone(),
-        close_rx.clone(),
-        client_status_tx,
-    ));
+        Ok::<(), anyhow::Error>(())
+    };
 
     #[cfg(not(target_os = "windows"))]
-    {
+    let close_task = async move {
         signal::ctrl_c().await?;
-    }
+        close_tx.send(true)?;
+        return Ok::<(), anyhow::Error>(());
+    };
+
     #[cfg(target_os = "windows")]
-    {
+    let close_task = async move {
         let mut ctrl_c_signal = signal::windows::ctrl_c()?;
         let mut ctrl_close_signal = signal::windows::ctrl_close()?;
         let mut ctrl_break_signal = signal::windows::ctrl_break()?;
@@ -413,21 +587,50 @@ async fn main() -> Result<()> {
             _ = ctrl_break_signal.recv() => { },
             _ = ctrl_logoff_signal.recv() => { },
             _ = ctrl_shutdown_signal.recv() => { },
-        };
-    }
+        }
+        close_tx.send(true)?;
+        return Ok::<(), anyhow::Error>(());
+    };
 
-    close_tx.send(true)?;
-    if let Err(e) = stream_joinh.await? {
+    let payload_joinh = tokio::spawn(payload_server(
+        server_addr,
+        config.clone(),
+        close_rx.clone(),
+        client_status_tx,
+    ));
+    let close_joinh = tokio::spawn(close_task);
+
+    let local_sdasd = tokio::task::LocalSet::new();
+    let stream_joinh = local_sdasd.spawn_local(stream_server(
+        server_addr,
+        data_send_rx,
+        close_rx.clone(),
+        client_status_rx,
+    ));
+    let playback_capturer_joinh = local_sdasd.spawn_local(playback_capturer_task);
+
+    local_sdasd.await;
+    if let Err(e) = stream_joinh.await {
         error!("{e:?}");
     }
-    if let Err(e) = payload_joinh.await? {
+    if let Err(e) = playback_capturer_joinh.await {
         error!("{e:?}");
     }
 
-    stream_close_tx.send(true)?;
-    stream_thread
-        .join()
-        .map_err(|e| anyhow!("Could not join stream thread: {e:?}"))??;
+    let (payload_res, close_res) = tokio::join!(payload_joinh, close_joinh);
+    // if let Err(e) = stream_joinh.await {
+    //     error!("{e:?}");
+    // }
+    if let Err(e) = payload_res {
+        error!("{e:?}");
+    }
+    if let Err(e) = close_res {
+        error!("{e:?}");
+    }
+
+    // stream_thread
+    //     .join()
+    //     .map_err(|e| anyhow!("Could not join stream thread: {e:?}"))??;
 
     debug!("Server closed successfully");
 
