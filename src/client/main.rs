@@ -27,7 +27,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpStream, UdpSocket},
     signal,
-    sync::{mpsc, watch},
+    sync::watch,
 };
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{
@@ -62,145 +62,6 @@ async fn recv_data(stream: &mut TcpStream) -> Result<Vec<u8>> {
     let mut bytes = vec![0u8; len as usize];
     stream.read_exact(&mut bytes).await?;
     Ok(bytes)
-}
-
-async fn decoder_task(
-    mut data_receiver: mpsc::Receiver<Vec<u8>>,
-    mut producer: Caching<Arc<SharedRb<Heap<f32>>>, true, false>,
-    mut close_rx: watch::Receiver<bool>,
-) -> Result<()> {
-    info!("Starting Decoder Task");
-
-    let decode_ring = HeapRb::<u8>::new(5400);
-    let (mut decode_producer, decode_consumer) = decode_ring.split();
-
-    // Await for the header and
-    if let Some(data) = data_receiver.recv().await {
-        decode_producer.push_slice(&data);
-    } else {
-        return Err(anyhow!("Error obtaining header"));
-    }
-
-    let mut vf: Box<MaybeUninit<OggVorbis_File>> = Box::new(MaybeUninit::uninit());
-
-    unsafe {
-        let source = Box::into_raw(decode_consumer.into());
-
-        let callbacks = ov_callbacks {
-            read_func: {
-                // This read callback should match the stdio fread behavior.
-                // See: https://man7.org/linux/man-pages/man3/fread.3p.html
-                unsafe extern "C" fn read_func(
-                    ptr: *mut c_void,
-                    size: usize,
-                    count: usize,
-                    datasource: *mut c_void,
-                ) -> usize {
-                    let source =
-                        &mut *(datasource.cast::<Caching<Arc<SharedRb<Heap<u8>>>, false, true>>());
-                    let buf = std::slice::from_raw_parts_mut(ptr.cast(), size * count);
-                    let ret = source.pop_slice(buf);
-                    return ret;
-                }
-                Some(read_func)
-            },
-            seek_func: None,
-            close_func: {
-                unsafe extern "C" fn close_func(datasource: *mut c_void) -> c_int {
-                    // Drop the Read when it's no longer needed by vorbisfile.
-                    // This is called by ov_clear
-                    drop(Box::from_raw(datasource.cast::<Caching<
-                        Arc<SharedRb<Heap<u8>>>,
-                        false,
-                        true,
-                    >>()));
-                    0
-                }
-                Some(close_func)
-            },
-            tell_func: None,
-        };
-
-        let res = ov_open_callbacks(
-            source.cast(),
-            vf.as_mut_ptr(),
-            std::ptr::null(),
-            0,
-            callbacks,
-        );
-        if res != 0 {
-            todo!("Error");
-        }
-
-        let channels = (*vf.assume_init_ref().vi).channels as usize;
-
-        println!("Channels!! {}", channels);
-    }
-
-    loop {
-        if let Ok(changed) = close_rx.has_changed() {
-            if changed && *close_rx.borrow_and_update() {
-                break;
-            }
-        }
-
-        if let Some(data) = data_receiver.recv().await {
-            decode_producer.push_slice(&data);
-        } else {
-            if data_receiver.is_closed() {
-                break;
-            }
-            continue;
-        }
-
-        let mut current_bitstream = Box::new(MaybeUninit::uninit());
-        let mut sample_buf = Box::new(MaybeUninit::uninit());
-
-        unsafe {
-            loop {
-                let samples_read = ov_read_float(
-                    vf.as_mut_ptr(),
-                    sample_buf.as_mut_ptr(),
-                    2048,
-                    current_bitstream.as_mut_ptr(),
-                );
-
-                if samples_read <= 0 {
-                    // debug!("Decode EOF reached");
-                    break;
-                }
-
-                if samples_read > 0 {
-                    if current_bitstream.assume_init_read() != 0 {
-                        return Err(anyhow!("VorbisError::UnsupportedStreamChaining"));
-                    }
-
-                    let buf: *mut *mut f32 = sample_buf.assume_init_read();
-                    let samples_read = samples_read as usize;
-                    let channels = (*vf.assume_init_ref().vi).channels as usize;
-
-                    let mut values =
-                        std::slice::from_raw_parts(buf, channels)
-                            .iter()
-                            .map(|channel_samples| {
-                                std::slice::from_raw_parts(*channel_samples, samples_read)
-                            });
-
-                    let channel1 = values.next().unwrap();
-                    producer.push_slice(channel1);
-                } else {
-                    // Ok(None)
-                }
-            }
-        }
-    }
-
-    unsafe {
-        ov_clear(vf.as_mut_ptr());
-    }
-
-    info!("Finishing Decoder Task");
-    Ok::<(), anyhow::Error>(())
 }
 
 async fn main_ex() -> Result<()> {
@@ -364,7 +225,7 @@ async fn main_ex() -> Result<()> {
     let latency_samples = latency_frames as usize * config.channels() as usize;
 
     // The buffer to share samples
-    let ring = HeapRb::<f32>::new(latency_samples * 2);
+    let ring = HeapRb::<f32>::new(latency_samples);
     let (mut producer, mut consumer) = ring.split();
 
     info!("Latency Samples: {latency_samples}");
@@ -379,7 +240,6 @@ async fn main_ex() -> Result<()> {
     }
 
     let (close_tx, close_rx) = watch::channel(false);
-    let (data_obtained_tx, data_obtained_rx) = mpsc::channel(50);
 
     let err_fn = move |err| {
         error!("an error occurred on stream: {}", err);
@@ -387,11 +247,19 @@ async fn main_ex() -> Result<()> {
 
     let mut close_rx_stream_receiver_task = close_rx.clone();
     let stream_receiver_task = async move {
+        info!("Starting receiver task");
+
         let local_addr: SocketAddr = "0.0.0.0:12312".parse()?;
         let cli = UdpSocket::bind(local_addr).await?;
         debug!("Using local address: {}", cli.local_addr()?);
         cli.connect(remote_addr).await?;
         let mut buf = [0; 10240];
+
+        let decode_ring = HeapRb::<u8>::new(5400);
+        let (mut decode_producer, decode_consumer) = decode_ring.split();
+        let source = Box::into_raw(decode_consumer.into());
+
+        let mut vf: Box<MaybeUninit<OggVorbis_File>> = Box::new(MaybeUninit::uninit());
 
         let mut stream_status = StreamStatus::Starting;
         loop {
@@ -422,27 +290,115 @@ async fn main_ex() -> Result<()> {
 
             match stream_status {
                 StreamStatus::Starting => {
-                    let res = data_obtained_tx.send(buf[..recv_len].to_vec()).await;
-                    if let Err(e) = res {
-                        error!("Could not send data to decode: {e:?}");
+                    decode_producer.push_slice(&buf[..recv_len]);
+
+                    unsafe {
+                        let callbacks = ov_callbacks {
+                            read_func: {
+                                // This read callback should match the stdio fread behavior.
+                                // See: https://man7.org/linux/man-pages/man3/fread.3p.html
+                                unsafe extern "C" fn read_func(
+                                    ptr: *mut c_void,
+                                    size: usize,
+                                    count: usize,
+                                    datasource: *mut c_void,
+                                ) -> usize {
+                                    let source = &mut *(datasource.cast::<Caching<
+                                        Arc<SharedRb<Heap<u8>>>,
+                                        false,
+                                        true,
+                                    >>(
+                                    ));
+                                    let buf =
+                                        std::slice::from_raw_parts_mut(ptr.cast(), size * count);
+                                    let ret = source.pop_slice(buf);
+                                    return ret;
+                                }
+                                Some(read_func)
+                            },
+                            seek_func: None,
+                            close_func: {
+                                unsafe extern "C" fn close_func(datasource: *mut c_void) -> c_int {
+                                    // Drop the Read when it's no longer needed by vorbisfile.
+                                    // This is called by ov_clear
+                                    drop(Box::from_raw(datasource.cast::<Caching<
+                                        Arc<SharedRb<Heap<u8>>>,
+                                        false,
+                                        true,
+                                    >>(
+                                    )));
+                                    0
+                                }
+                                Some(close_func)
+                            },
+                            tell_func: None,
+                        };
+
+                        let res = ov_open_callbacks(
+                            source.cast(),
+                            vf.as_mut_ptr(),
+                            std::ptr::null(),
+                            0,
+                            callbacks,
+                        );
+                        if res != 0 {
+                            todo!("Error");
+                        }
                     }
+
                     stream_status = StreamStatus::Streaming;
                 }
                 StreamStatus::Streaming => {
-                    let res = data_obtained_tx.send(buf[..recv_len].to_vec()).await;
-                    if let Err(e) = res {
-                        error!("Could not send data to decode: {e:?}");
+                    decode_producer.push_slice(&buf[..recv_len]);
+
+                    let mut current_bitstream = Box::new(MaybeUninit::uninit());
+                    let mut sample_buf = Box::new(MaybeUninit::uninit());
+
+                    unsafe {
+                        loop {
+                            let samples_read = ov_read_float(
+                                vf.as_mut_ptr(),
+                                sample_buf.as_mut_ptr(),
+                                2048,
+                                current_bitstream.as_mut_ptr(),
+                            );
+
+                            if samples_read <= 0 {
+                                // debug!("Decode EOF reached");
+                                break;
+                            }
+
+                            if samples_read > 0 {
+                                if current_bitstream.assume_init_read() != 0 {
+                                    return Err(anyhow!("VorbisError::UnsupportedStreamChaining"));
+                                }
+
+                                let buf: *mut *mut f32 = sample_buf.assume_init_read();
+                                let samples_read = samples_read as usize;
+                                let channels = (*vf.assume_init_ref().vi).channels as usize;
+
+                                let mut values = std::slice::from_raw_parts(buf, channels)
+                                    .iter()
+                                    .map(|channel_samples| {
+                                        std::slice::from_raw_parts(*channel_samples, samples_read)
+                                    });
+
+                                let channel1 = values.next().unwrap();
+                                producer.push_slice(channel1);
+                            }
+                        }
                     }
                 } // StreamStatus::Stopped => {}
             };
         }
 
+        info!("Closing receiver task");
         Ok::<(), anyhow::Error>(())
     };
 
     let config_clone = config.clone();
     let device_clone = device.clone();
-    let mut player_close_rx = close_rx.clone();
+    let mut player_close_rx = close_rx;
     let player_task = move || {
         debug!("Creating playback thread");
 
@@ -512,6 +468,7 @@ async fn main_ex() -> Result<()> {
             _ = server_receiver => { }
         };
         close_tx.send(true)?;
+        close_tx.closed().await;
         return Ok::<(), anyhow::Error>(());
     };
 
@@ -531,25 +488,18 @@ async fn main_ex() -> Result<()> {
             _ = server_receiver => { }
         }
         close_tx.send(true)?;
+        close_tx.closed().await;
         return Ok::<(), anyhow::Error>(());
     };
 
     let close_joinh = tokio::spawn(close_task);
-    let stream_receiver_joinh = tokio::spawn(stream_receiver_task);
 
     let player_joinh = std::thread::spawn(player_task);
 
-    let (close_res, stream_receiver_res, decoder_res) = tokio::join!(
-        close_joinh,
-        stream_receiver_joinh,
-        decoder_task(data_obtained_rx, producer, close_rx.clone())
-    );
+    let (close_res, stream_receiver_res) = tokio::join!(close_joinh, stream_receiver_task);
 
     let player_res = player_joinh.join();
 
-    if let Err(e) = decoder_res {
-        error!("{e:?}");
-    };
     if let Err(e) = close_res {
         error!("{e:?}");
     };
