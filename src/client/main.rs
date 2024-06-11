@@ -19,7 +19,7 @@ use log::{debug, error, info, trace};
 use oabs_lib::{OABSMessage, SupportedStreamConfigDeserialize};
 use ringbuf::{
     storage::Heap,
-    traits::{Consumer, Observer, Producer, Split},
+    traits::{Consumer, Producer, Split},
     wrap::caching::Caching,
     HeapRb, SharedRb,
 };
@@ -27,7 +27,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpStream, UdpSocket},
     signal,
-    sync::{mpsc, watch}
+    sync::{mpsc, watch},
 };
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{
@@ -74,9 +74,6 @@ async fn decoder_task(
     let decode_ring = HeapRb::<u8>::new(5400);
     let (mut decode_producer, decode_consumer) = decode_ring.split();
 
-    let mut vf: Box<MaybeUninit<OggVorbis_File>> = Box::new(MaybeUninit::uninit());
-    let source = Box::into_raw(decode_consumer.into());
-
     // Await for the header and
     if let Some(data) = data_receiver.recv().await {
         decode_producer.push_slice(&data);
@@ -84,7 +81,11 @@ async fn decoder_task(
         return Err(anyhow!("Error obtaining header"));
     }
 
+    let mut vf: Box<MaybeUninit<OggVorbis_File>> = Box::new(MaybeUninit::uninit());
+
     unsafe {
+        let source = Box::into_raw(decode_consumer.into());
+
         let callbacks = ov_callbacks {
             read_func: {
                 // This read callback should match the stdio fread behavior.
@@ -98,22 +99,8 @@ async fn decoder_task(
                     let source =
                         &mut *(datasource.cast::<Caching<Arc<SharedRb<Heap<u8>>>, false, true>>());
                     let buf = std::slice::from_raw_parts_mut(ptr.cast(), size * count);
-                    let ret: usize = source.pop_slice(buf);
+                    let ret = source.pop_slice(buf);
                     return ret;
-                    // match source.read(buf) {
-                    //     Ok(n) => n / size,
-                    //     Err(err) => {
-                    //         // vorbisfile checks errno to tell EOF apart from read errors:
-                    //         // https://xiph.org/vorbis/doc/vorbisfile/callbacks.html
-                    //         // Rust Read trait implementations are not required to set
-                    //         // errno, so make sure we set errno with the most informative
-                    //         // value possible, falling back to a non-zero errno, which is
-                    //         // implied by the C standard to signal some condition
-                    //         // set_errno(Errno(err.raw_os_error().unwrap_or(i32::MAX)));
-
-                    //         0
-                    //     }
-                    // }
                 }
                 Some(read_func)
             },
@@ -456,7 +443,7 @@ async fn main_ex() -> Result<()> {
     let config_clone = config.clone();
     let device_clone = device.clone();
     let mut player_close_rx = close_rx.clone();
-    let player_task = async move {
+    let player_task = move || {
         debug!("Creating playback thread");
 
         let stream = device_clone.build_output_stream(
@@ -475,11 +462,12 @@ async fn main_ex() -> Result<()> {
         info!("Starting playback");
         stream.play()?;
         loop {
-            if let Ok(_) = player_close_rx.changed().await {
-                if *player_close_rx.borrow_and_update() {
+            if let Ok(changed) = player_close_rx.has_changed() {
+                if changed && *player_close_rx.borrow_and_update() {
                     break;
                 }
             }
+            std::thread::sleep(Duration::from_millis(10));
         }
         info!("Stopping playback");
         stream.pause()?;
@@ -549,12 +537,15 @@ async fn main_ex() -> Result<()> {
     let close_joinh = tokio::spawn(close_task);
     let stream_receiver_joinh = tokio::spawn(stream_receiver_task);
 
-    let (close_res, player_res, stream_receiver_res, decoder_res) = tokio::join!(
+    let player_joinh = std::thread::spawn(player_task);
+
+    let (close_res, stream_receiver_res, decoder_res) = tokio::join!(
         close_joinh,
-        player_task,
         stream_receiver_joinh,
         decoder_task(data_obtained_rx, producer, close_rx.clone())
     );
+
+    let player_res = player_joinh.join();
 
     if let Err(e) = decoder_res {
         error!("{e:?}");

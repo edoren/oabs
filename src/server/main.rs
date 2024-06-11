@@ -376,7 +376,7 @@ async fn stream_server(
                             panic!("FUCK ERROR WRITE");
                         }
 
-                        while ogg_stream_pageout(os.as_mut_ptr(), og.as_mut_ptr()) != 0 {
+                        while ogg_stream_flush(os.as_mut_ptr(), og.as_mut_ptr()) != 0 {
                             let ogg_page = og.assume_init_ref();
                             encoded_data.extend_from_slice(slice::from_raw_parts(
                                 ogg_page.header,
@@ -386,21 +386,11 @@ async fn stream_server(
                                 ogg_page.body,
                                 ogg_page.body_len as usize,
                             ));
-
-                            /* this could be set above, but for illustrative purposes, I do
-                            it here (to show that vorbis does know where the stream ends) */
-
-                            if ogg_page_eos(ogg_page) > 0 {
-                                println!("EROR D:");
-                                break 'stream_loop;
-                            };
                         }
                     }
                 }
             }
         }
-
-        println!("{} {}", encoded_data.len(), audio_block[0].len());
 
         if encoded_data.is_empty() {
             continue;
@@ -483,15 +473,11 @@ async fn main() -> Result<()> {
             .map(|x| x.name().unwrap_or(String::new()))
             .collect::<Vec<String>>();
 
-        // let selection = FuzzySelect::with_theme(&ColorfulTheme::default())
-        //     .with_prompt("Select the device to capture")
-        //     .default(0)
-        //     .items(&devices_names)
-        //     .interact()?;
-
-        let selection = 0;
-
-        println!("{}", devices_names[selection]);
+        let selection = FuzzySelect::with_theme(&ColorfulTheme::default())
+            .with_prompt("Select the device to capture")
+            .default(0)
+            .items(&devices_names)
+            .interact()?;
 
         input_devices[selection].clone()
     };
@@ -603,27 +589,20 @@ async fn main() -> Result<()> {
     let playback_capturer_joinh = local_sdasd.spawn_local(playback_capturer_task);
 
     local_sdasd.await;
+
+    let (payload_res, close_res) = tokio::join!(payload_joinh, close_joinh);
     if let Err(e) = stream_joinh.await {
         error!("{e:?}");
     }
     if let Err(e) = playback_capturer_joinh.await {
         error!("{e:?}");
     }
-
-    let (payload_res, close_res) = tokio::join!(payload_joinh, close_joinh);
-    // if let Err(e) = stream_joinh.await {
-    //     error!("{e:?}");
-    // }
     if let Err(e) = payload_res {
         error!("{e:?}");
     }
     if let Err(e) = close_res {
         error!("{e:?}");
     }
-
-    // stream_thread
-    //     .join()
-    //     .map_err(|e| anyhow!("Could not join stream thread: {e:?}"))??;
 
     debug!("Server closed successfully");
 
