@@ -65,6 +65,94 @@ async fn recv_data(stream: &mut TcpStream) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+unsafe fn create_vorbis_file(
+    source: *mut ::std::os::raw::c_void,
+) -> Result<Box<MaybeUninit<OggVorbis_File>>> {
+    let mut vf: Box<MaybeUninit<OggVorbis_File>> = Box::new(MaybeUninit::uninit());
+    let callbacks = ov_callbacks {
+        read_func: {
+            // This read callback should match the stdio fread behavior.
+            // See: https://man7.org/linux/man-pages/man3/fread.3p.html
+            unsafe extern "C" fn read_func(
+                ptr: *mut c_void,
+                size: usize,
+                count: usize,
+                datasource: *mut c_void,
+            ) -> usize {
+                let source =
+                    &mut *(datasource.cast::<Caching<Arc<SharedRb<Heap<u8>>>, false, true>>());
+                let buf = std::slice::from_raw_parts_mut(ptr.cast(), size * count);
+                let ret = source.pop_slice(buf);
+                return ret;
+            }
+            Some(read_func)
+        },
+        seek_func: None,
+        close_func: {
+            unsafe extern "C" fn close_func(datasource: *mut c_void) -> c_int {
+                // Drop the Read when it's no longer needed by vorbisfile.
+                // This is called by ov_clear
+                drop(Box::from_raw(datasource.cast::<Caching<
+                    Arc<SharedRb<Heap<u8>>>,
+                    false,
+                    true,
+                >>()));
+                0
+            }
+            Some(close_func)
+        },
+        tell_func: None,
+    };
+
+    let res = ov_open_callbacks(source, vf.as_mut_ptr(), std::ptr::null(), 0, callbacks);
+    if res != 0 {
+        Err(anyhow!(
+            "Could not create OggVorbis instance. Error code: {res}"
+        ))
+    } else {
+        Ok(vf)
+    }
+}
+
+unsafe fn decode_part(
+    vf: *mut OggVorbis_File,
+    out: &mut [&mut Caching<Arc<SharedRb<Heap<f32>>>, true, false>],
+) -> Result<()> {
+    let mut current_bitstream = Box::new(MaybeUninit::uninit());
+    let mut sample_buf = Box::new(MaybeUninit::uninit());
+
+    loop {
+        let samples_read = ov_read_float(
+            vf,
+            sample_buf.as_mut_ptr(),
+            2048,
+            current_bitstream.as_mut_ptr(),
+        );
+
+        if samples_read <= 0 {
+            return Ok(());
+        }
+
+        if samples_read > 0 {
+            if current_bitstream.assume_init_read() != 0 {
+                return Err(anyhow!("VorbisError::UnsupportedStreamChaining"));
+            }
+
+            let buf: *mut *mut f32 = sample_buf.assume_init_read();
+            let channels = (*(*vf).vi).channels as usize;
+            let samples_read = samples_read as usize;
+
+            let mut values = std::slice::from_raw_parts(buf, channels)
+                .iter()
+                .map(|channel_samples| std::slice::from_raw_parts(*channel_samples, samples_read));
+
+            for i in 0..out.len() {
+                out[0].push_slice(values.nth(i).unwrap_or(&[]));
+            }
+        }
+    }
+}
+
 async fn main_ex() -> Result<()> {
     let opt = Opt::parse();
 
@@ -268,7 +356,7 @@ async fn main_ex() -> Result<()> {
         let (mut decode_producer, decode_consumer) = decode_ring.split();
         let source = Box::into_raw(decode_consumer.into());
 
-        let mut vf: Box<MaybeUninit<OggVorbis_File>> = Box::new(MaybeUninit::uninit());
+        let mut vorbis_file: Option<Box<MaybeUninit<OggVorbis_File>>> = None;
 
         let mut stream_status = StreamStatus::Starting;
         loop {
@@ -301,105 +389,33 @@ async fn main_ex() -> Result<()> {
                 StreamStatus::Starting => {
                     decode_producer.push_slice(&buf[..recv_len]);
 
-                    unsafe {
-                        let callbacks = ov_callbacks {
-                            read_func: {
-                                // This read callback should match the stdio fread behavior.
-                                // See: https://man7.org/linux/man-pages/man3/fread.3p.html
-                                unsafe extern "C" fn read_func(
-                                    ptr: *mut c_void,
-                                    size: usize,
-                                    count: usize,
-                                    datasource: *mut c_void,
-                                ) -> usize {
-                                    let source = &mut *(datasource.cast::<Caching<
-                                        Arc<SharedRb<Heap<u8>>>,
-                                        false,
-                                        true,
-                                    >>(
-                                    ));
-                                    let buf =
-                                        std::slice::from_raw_parts_mut(ptr.cast(), size * count);
-                                    let ret = source.pop_slice(buf);
-                                    return ret;
-                                }
-                                Some(read_func)
-                            },
-                            seek_func: None,
-                            close_func: {
-                                unsafe extern "C" fn close_func(datasource: *mut c_void) -> c_int {
-                                    // Drop the Read when it's no longer needed by vorbisfile.
-                                    // This is called by ov_clear
-                                    drop(Box::from_raw(datasource.cast::<Caching<
-                                        Arc<SharedRb<Heap<u8>>>,
-                                        false,
-                                        true,
-                                    >>(
-                                    )));
-                                    0
-                                }
-                                Some(close_func)
-                            },
-                            tell_func: None,
-                        };
-
-                        let res = ov_open_callbacks(
-                            source.cast(),
-                            vf.as_mut_ptr(),
-                            std::ptr::null(),
-                            0,
-                            callbacks,
-                        );
-                        if res != 0 {
-                            return Err(anyhow!(
-                                "Could not create OggVorbis instance. Error code: {res}"
-                            ));
+                    match unsafe { create_vorbis_file(source.cast()) } {
+                        Ok(vf) => {
+                            vorbis_file = Some(vf);
+                        }
+                        Err(e) => {
+                            error!("Error creating Vorbis File: {e:?} - Header Buffer: {recv_len}");
                         }
                     }
 
                     stream_status = StreamStatus::Streaming;
                 }
                 StreamStatus::Streaming => {
-                    decode_producer.push_slice(&buf[..recv_len]);
-
-                    let mut current_bitstream = Box::new(MaybeUninit::uninit());
-                    let mut sample_buf = Box::new(MaybeUninit::uninit());
-
-                    unsafe {
-                        loop {
-                            let samples_read = ov_read_float(
-                                vf.as_mut_ptr(),
-                                sample_buf.as_mut_ptr(),
-                                2048,
-                                current_bitstream.as_mut_ptr(),
-                            );
-
-                            if samples_read <= 0 {
-                                break;
-                            }
-
-                            if samples_read > 0 {
-                                if current_bitstream.assume_init_read() != 0 {
-                                    return Err(anyhow!("VorbisError::UnsupportedStreamChaining"));
-                                }
-
-                                let buf: *mut *mut f32 = sample_buf.assume_init_read();
-                                let samples_read = samples_read as usize;
-                                let channels = (*vf.assume_init_ref().vi).channels as usize;
-
-                                let mut values = std::slice::from_raw_parts(buf, channels)
-                                    .iter()
-                                    .map(|channel_samples| {
-                                        std::slice::from_raw_parts(*channel_samples, samples_read)
-                                    });
-
-                                let channel1 = values.next().unwrap();
-                                producer.push_slice(channel1);
-                            }
+                    if let Some(vf) = &mut vorbis_file {
+                        decode_producer.push_slice(&buf[..recv_len]);
+                        let result = unsafe { decode_part(vf.as_mut_ptr(), &mut [&mut producer]) };
+                        if let Err(e) = result {
+                            error!("Error Decoding Part: {e:?}");
                         }
+                    } else {
+                        error!("This should not happen");
                     }
                 } // StreamStatus::Stopped => {}
             };
+        }
+
+        if let Some(vf) = &mut vorbis_file {
+            unsafe { ov_clear(vf.as_mut_ptr()) };
         }
 
         debug!("Closing stream receiver task");
@@ -449,7 +465,11 @@ async fn main_ex() -> Result<()> {
 
         loop {
             if let Ok(data) = recv_data(&mut stream).await {
-                let value = unsafe { std::str::from_utf8_unchecked(&data) };
+                let value = match std::str::from_utf8(&data) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+
                 if value == "PING" {
                     trace!("PING");
                     loop {
