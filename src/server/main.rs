@@ -1,5 +1,7 @@
 use std::{
+    cmp::Eq,
     collections::HashMap,
+    io,
     mem::MaybeUninit,
     net::{Ipv4Addr, SocketAddr},
     slice,
@@ -9,7 +11,7 @@ use std::{
 
 use anyhow::{anyhow, Result};
 use aotuv_lancer_vorbis_sys::*;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     Device, SampleFormat, SampleRate, SupportedStreamConfig,
@@ -18,7 +20,8 @@ use dialoguer::{theme::ColorfulTheme, FuzzySelect};
 use log::{debug, error, info, trace};
 use oabs_lib::{OABSMessage, SupportedStreamConfigSerialize};
 use ogg_next_sys::*;
-use rand::Rng;
+use rand::{thread_rng, Rng};
+use strum::{EnumIter, EnumString, IntoEnumIterator, IntoStaticStr};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
@@ -35,22 +38,19 @@ use tracing_subscriber::{
     filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
 };
 
+#[derive(PartialEq, Eq, Hash, ValueEnum, Debug, Clone, EnumIter, EnumString, IntoStaticStr)]
+#[strum(serialize_all = "title_case")]
+enum StreamQuality {
+    LOWEST,
+    LOW,
+    MEDIUM,
+    HIGH,
+    HIGHEST,
+}
+
 enum ClientStatus {
     Connected { id: String },
     Disconnected { id: String },
-}
-
-async fn send_data(stream: &mut TcpStream, data: &[u8]) -> Result<()> {
-    stream.write_u16(data.len() as u16).await?;
-    stream.write_all(data).await?;
-    Ok(())
-}
-
-async fn recv_data(stream: &mut TcpStream) -> Result<Vec<u8>> {
-    let len = stream.read_u16().await?;
-    let mut bytes = vec![0u8; len as usize];
-    stream.read_exact(&mut bytes).await?;
-    Ok(bytes)
 }
 
 #[derive(Parser, Debug)]
@@ -61,12 +61,25 @@ struct Opt {
     port: u16,
 
     /// Specify the delay between input and output
-    #[arg(short, long, value_name = "MAX_CLIENTS", default_value_t = 5)]
-    max_connections: u16,
+    #[arg(short, long, value_name = "QUALITY", value_enum)]
+    quality: Option<StreamQuality>,
 
     /// Specify the delay between input and output
-    #[arg(short, long, value_name = "VERBOSE", default_value_t = false)]
-    verbose: bool,
+    #[arg(short, long, value_name = "MAX_CLIENTS", default_value_t = 5)]
+    max_connections: u16,
+}
+
+async fn send_data(stream: &mut TcpStream, data: &[u8]) -> Result<(), io::Error> {
+    stream.write_u16(data.len() as u16).await?;
+    stream.write_all(data).await?;
+    Ok(())
+}
+
+async fn recv_data(stream: &mut TcpStream) -> Result<Vec<u8>, io::Error> {
+    let len = stream.read_u16().await?;
+    let mut bytes = vec![0u8; len as usize];
+    stream.read_exact(&mut bytes).await?;
+    Ok(bytes)
 }
 
 static COUNTER: AtomicUsize = AtomicUsize::new(1);
@@ -81,15 +94,12 @@ async fn client_handler(
     client_status_tx: tokio::sync::mpsc::Sender<ClientStatus>,
 ) -> Result<()> {
     let client_id = get_id().to_string();
-    let address = stream.peer_addr()?;
 
-    debug!("Sending to {:?} payload {:?}", address, client_id);
     let client_id_msg = serde_json::to_vec(&OABSMessage::ClientId {
         id: client_id.clone(),
     })?;
     send_data(&mut stream, &client_id_msg).await?;
 
-    debug!("Sending to {:?} payload {:?}", address, config);
     let value = serde_json::to_vec(&SupportedStreamConfigSerialize(&config))?;
     send_data(&mut stream, &value).await?;
 
@@ -100,42 +110,51 @@ async fn client_handler(
         .await;
 
     let client_task = async {
+        let mut pong_instant = Instant::now() + Duration::from_secs(10);
         loop {
-            let pong_instant = Instant::now() + Duration::from_secs(10);
             match send_data(&mut stream, "PING".as_bytes()).await {
                 Ok(_) => {
-                    trace!("Sending PING to client {client_id:?}")
+                    trace!("Sending PING to client with id {client_id:?}")
                 }
-                Err(e) => {
-                    error!("Error sending PING {e:?}")
-                }
+                Err(e) => match e.kind() {
+                    io::ErrorKind::ConnectionAborted | io::ErrorKind::ConnectionReset => {
+                        info!("Connection aborted from client {client_id}");
+                        break;
+                    }
+                    _ => {
+                        error!("Error sending PING from client with id {client_id:?}: {e:?}");
+                    }
+                },
             }
 
             let read_result = match timeout_at(pong_instant, recv_data(&mut stream)).await {
                 Ok(result) => result,
-                Err(e) => {
-                    error!("Error receiving PONG {e:?}");
+                Err(_) => {
+                    info!("Client with id {client_id:?} forgot to PONG");
                     break;
                 }
             };
 
             match read_result {
-                Err(_) => {
-                    break;
+                Err(e) => {
+                    if e.kind() == io::ErrorKind::UnexpectedEof {
+                        info!("Connection aborted from client with id {client_id:?}");
+                        break;
+                    }
                 }
                 Ok(data) => {
                     if data.len() == 0 {
-                        debug!("Empty data frame for client {client_id}. Closing.");
+                        debug!("Empty data frame for client with id {client_id:?}. Closing.");
                         break;
                     }
-                    let value = unsafe { std::str::from_utf8_unchecked(&data) };
-                    if value == "PONG" {
-                        trace!("YAAAAAS PONG");
+                    if let Ok(value) = std::str::from_utf8(&data) {
+                        if value == "PONG" {
+                            sleep(Duration::from_secs(5)).await;
+                            pong_instant = Instant::now() + Duration::from_secs(10);
+                        }
                     }
                 }
             }
-
-            sleep(Duration::from_secs(5)).await;
         }
     };
 
@@ -152,7 +171,7 @@ async fn client_handler(
         })
         .await;
 
-    debug!("Client closed with id: {client_id}");
+    info!("Client closed with id {client_id:?}");
 
     Ok(())
 }
@@ -163,10 +182,10 @@ async fn payload_server(
     mut close_rx: watch::Receiver<bool>,
     client_status_tx: mpsc::Sender<ClientStatus>,
 ) -> Result<()> {
-    debug!("Starting Payload Server");
+    debug!("Starting payload server");
 
     let listener = TcpListener::bind(server_addr).await?;
-    debug!("Payload server listening on: {}", listener.local_addr()?);
+    info!("Payload server listening on: {}", listener.local_addr()?);
     let mut streams = JoinSet::new();
     loop {
         let stream = tokio::select! {
@@ -190,21 +209,22 @@ async fn payload_server(
 
     while let Some(_res) = streams.join_next().await {}
 
-    debug!("Stopping Payload Server");
+    debug!("Stopping payload server");
     Ok(())
 }
 
 async fn stream_server(
     server_addr: SocketAddr,
+    quality: f32,
     config: SupportedStreamConfig,
     mut data_send_rx: mpsc::UnboundedReceiver<Vec<f32>>,
     mut close_rx: watch::Receiver<bool>,
     mut client_status_rx: mpsc::Receiver<ClientStatus>,
 ) -> Result<()> {
-    debug!("Starting Stream Server");
+    debug!("Starting stream server");
 
     let sock = UdpSocket::bind(server_addr).await?;
-    debug!("Stream server listening on: {}", sock.local_addr()?);
+    info!("Stream server listening on: {}", sock.local_addr()?);
 
     let mut os: Box<MaybeUninit<ogg_stream_state>> = Box::new(MaybeUninit::uninit());
     let mut og: Box<MaybeUninit<ogg_page>> = Box::new(MaybeUninit::uninit());
@@ -223,7 +243,7 @@ async fn stream_server(
             vi.as_mut_ptr(),
             config.channels() as i32,
             config.sample_rate().0 as i32,
-            0.1,
+            quality,
         );
         if ret != 0 {
             panic!("YAY");
@@ -235,7 +255,7 @@ async fn stream_server(
         vorbis_analysis_init(vd.as_mut_ptr(), vi.as_mut_ptr());
         vorbis_block_init(vd.as_mut_ptr(), vb.as_mut_ptr());
 
-        let serial_num = rand::thread_rng().gen();
+        let serial_num = thread_rng().gen();
         debug!("Serial: {}", serial_num);
         ogg_stream_init(os.as_mut_ptr(), serial_num);
 
@@ -272,7 +292,7 @@ async fn stream_server(
         }
     }
 
-    info!("Header Data: {}", header_data.len());
+    debug!("Header Data: {}", header_data.len());
 
     let mut buffer = [0; 8];
     let mut encoded_data: Vec<u8> = Vec::new();
@@ -291,7 +311,7 @@ async fn stream_server(
                 }
                 ClientStatus::Disconnected { id } => {
                     registered_clients.remove(&id);
-                    debug!("Removing client with id {id}");
+                    info!("Removing client with id {id:?}");
                 }
             }
         }
@@ -301,7 +321,7 @@ async fn stream_server(
             if msg.starts_with("START") {
                 let id = msg.split(" ").nth(1).unwrap();
                 registered_clients.insert(id.into(), Some(source));
-                debug!("Added interested {source} with id {id}");
+                info!("Added client {source} with id {id:?}");
                 let _len = sock.send_to(&header_data, source).await?;
             }
         }
@@ -416,7 +436,7 @@ async fn stream_server(
         vorbis_info_clear(vi.as_mut_ptr());
     }
 
-    debug!("Stopping Stream Server");
+    debug!("Stopping stream server");
     Ok(())
 }
 
@@ -461,32 +481,74 @@ async fn main() -> Result<()> {
 
     // App
 
+    println!(" ██████╗  █████╗ ██████╗ ███████╗");
+    println!("██╔═══██╗██╔══██╗██╔══██╗██╔════╝");
+    println!("██║   ██║███████║██████╔╝███████╗");
+    println!("██║   ██║██╔══██║██╔══██╗╚════██║");
+    println!("╚██████╔╝██║  ██║██████╔╝███████║");
+    println!(" ╚═════╝ ╚═╝  ╚═╝╚═════╝ ╚══════╝");
+    println!("[ Open Audio Broadcast Software ]");
+    println!();
+
     let server_addr = SocketAddr::new(Ipv4Addr::new(0, 0, 0, 0).into(), opt.port);
     let host = cpal::default_host();
 
-    #[cfg(not(target_os = "android"))]
     let device = {
-        let input_devices: Vec<Device> =
-            host.input_devices()?.filter(|x| x.name().is_ok()).collect();
+        #[cfg(not(target_os = "android"))]
+        {
+            let input_devices: Vec<Device> =
+                host.input_devices()?.filter(|x| x.name().is_ok()).collect();
 
-        let devices_names = input_devices
-            .iter()
-            .map(|x| x.name().unwrap_or(String::new()))
-            .collect::<Vec<String>>();
+            let devices_names = input_devices
+                .iter()
+                .map(|x| x.name().unwrap_or(String::new()))
+                .collect::<Vec<String>>();
 
-        let selection = FuzzySelect::with_theme(&ColorfulTheme::default())
-            .with_prompt("Select the device to capture")
-            .default(0)
-            .items(&devices_names)
-            .interact()?;
+            let selection = FuzzySelect::with_theme(&ColorfulTheme::default())
+                .with_prompt("Select the device to capture")
+                .default(0)
+                .items(&devices_names)
+                .interact()?;
 
-        input_devices[selection].clone()
+            input_devices[selection].clone()
+        }
+
+        #[cfg(target_os = "android")]
+        host.default_input_device()
+            .ok_or(anyhow!("Could not find default input device"))?
     };
 
-    #[cfg(target_os = "android")]
-    let device = host
-        .default_input_device()
-        .ok_or(anyhow!("Could not find default input device"))?;
+    let quality_value = {
+        let quialities: Vec<StreamQuality> = StreamQuality::iter().collect();
+
+        let quality = if let Some(quality) = opt.quality {
+            quality
+        } else {
+            #[cfg(not(target_os = "android"))]
+            {
+                let quialities_names: Vec<&str> = quialities.iter().map(|e| e.into()).collect();
+                let selection = FuzzySelect::with_theme(&ColorfulTheme::default())
+                    .with_prompt("Select the stream quality")
+                    .default(quialities.len() / 2)
+                    .items(&quialities_names)
+                    .interact()?;
+                quialities[selection].clone()
+            }
+            #[cfg(target_os = "android")]
+            {
+                quialities[quialities.len() / 2].clone()
+            }
+        };
+
+        let quality_val_min = -0.1;
+        let quality_val_max = 1.0;
+
+        quality_val_min
+            + (quality_val_max - quality_val_min) / (quialities.len() - 1) as f32
+                * ((quality as u32) as f32)
+    };
+
+    println!();
 
     let configs = device
         .supported_input_configs()?
@@ -530,7 +592,7 @@ async fn main() -> Result<()> {
             None,
         )?;
 
-        debug!("Begin recording");
+        info!("Begin recording");
         stream.play()?;
         loop {
             if let Ok(_) = stream_close_rx.changed().await {
@@ -540,7 +602,7 @@ async fn main() -> Result<()> {
             }
         }
         stream.pause()?;
-        debug!("Stopped recording");
+        info!("Stopped recording");
 
         drop(stream);
 
@@ -585,6 +647,7 @@ async fn main() -> Result<()> {
     let local_sdasd = tokio::task::LocalSet::new();
     let stream_joinh = local_sdasd.spawn_local(stream_server(
         server_addr,
+        quality_value,
         config.clone(),
         data_send_rx,
         close_rx,
