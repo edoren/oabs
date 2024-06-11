@@ -33,6 +33,7 @@ use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{
     filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
 };
+
 #[derive(Parser, Debug)]
 #[command(version, about = "Client", long_about = None)]
 struct Opt {
@@ -86,6 +87,7 @@ async fn main_ex() -> Result<()> {
         .filename_prefix("oabs")
         .filename_suffix("log")
         .build(logs_dir.clone())?;
+
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(non_blocking)
@@ -93,8 +95,13 @@ async fn main_ex() -> Result<()> {
         .with_filter(default_filter(LevelFilter::DEBUG))
         .boxed();
 
+    #[cfg(debug_assertions)]
+    let default_stdout_level_filter = LevelFilter::DEBUG;
+    #[cfg(not(debug_assertions))]
+    let default_stdout_level_filter = LevelFilter::INFO;
+
     let stdout_layer = tracing_subscriber::fmt::layer()
-        .with_filter(default_filter(LevelFilter::DEBUG))
+        .with_filter(default_filter(default_stdout_level_filter))
         .boxed();
 
     let mut layers = Vec::new();
@@ -183,6 +190,8 @@ async fn main_ex() -> Result<()> {
     debug!("Connecting to server {}", server_address);
     let mut stream = TcpStream::connect(remote_addr).await?;
 
+    info!("Connected to server {}", server_address);
+
     // Wait for the socket to be readable
     stream.readable().await?;
 
@@ -228,7 +237,7 @@ async fn main_ex() -> Result<()> {
     let ring = HeapRb::<f32>::new(latency_samples);
     let (mut producer, mut consumer) = ring.split();
 
-    info!("Latency Samples: {latency_samples}");
+    debug!("Latency Samples: {latency_samples}");
 
     // Fill the samples with 0.0 equal to the length of the delay.
     for _ in 0..latency_samples {
@@ -247,7 +256,7 @@ async fn main_ex() -> Result<()> {
 
     let mut close_rx_stream_receiver_task = close_rx.clone();
     let stream_receiver_task = async move {
-        info!("Starting receiver task");
+        debug!("Starting stream receiver task");
 
         let local_addr: SocketAddr = "0.0.0.0:12312".parse()?;
         let cli = UdpSocket::bind(local_addr).await?;
@@ -342,7 +351,9 @@ async fn main_ex() -> Result<()> {
                             callbacks,
                         );
                         if res != 0 {
-                            todo!("Error");
+                            return Err(anyhow!(
+                                "Could not create OggVorbis instance. Error code: {res}"
+                            ));
                         }
                     }
 
@@ -364,7 +375,6 @@ async fn main_ex() -> Result<()> {
                             );
 
                             if samples_read <= 0 {
-                                // debug!("Decode EOF reached");
                                 break;
                             }
 
@@ -392,7 +402,7 @@ async fn main_ex() -> Result<()> {
             };
         }
 
-        info!("Closing receiver task");
+        debug!("Closing stream receiver task");
         Ok::<(), anyhow::Error>(())
     };
 
@@ -400,9 +410,9 @@ async fn main_ex() -> Result<()> {
     let device_clone = device.clone();
     let mut player_close_rx = close_rx;
     let player_task = move || {
-        debug!("Creating playback thread");
+        debug!("Starting player task");
 
-        let stream = device_clone.build_output_stream(
+        let playback_stream = device_clone.build_output_stream(
             &config_clone.into(),
             move |data: &mut [f32], _: &_| {
                 let received_count = data.len();
@@ -415,8 +425,8 @@ async fn main_ex() -> Result<()> {
             None,
         )?;
 
-        info!("Starting playback");
-        stream.play()?;
+        debug!("Starting playback");
+        playback_stream.play()?;
         loop {
             if let Ok(changed) = player_close_rx.has_changed() {
                 if changed && *player_close_rx.borrow_and_update() {
@@ -425,17 +435,17 @@ async fn main_ex() -> Result<()> {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        info!("Stopping playback");
-        stream.pause()?;
+        debug!("Stopping playback");
+        playback_stream.pause()?;
 
-        drop(stream);
+        drop(playback_stream);
 
-        debug!("Stopping playback thread");
+        debug!("Stopping player task");
         Ok::<(), anyhow::Error>(())
     };
 
     let server_receiver = async move {
-        info!("Creating PONG handler");
+        debug!("Starting server connection task");
 
         loop {
             if let Ok(data) = recv_data(&mut stream).await {
@@ -458,7 +468,7 @@ async fn main_ex() -> Result<()> {
             }
         }
 
-        info!("Closing PONG handler");
+        debug!("Stopping server connection task");
     };
 
     #[cfg(not(target_os = "windows"))]
@@ -510,7 +520,7 @@ async fn main_ex() -> Result<()> {
         error!("{e:?}");
     };
 
-    debug!("Client closed successfully");
+    info!("Client closed successfully");
 
     Ok(())
 }
