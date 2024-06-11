@@ -548,6 +548,7 @@ async fn main() -> Result<()> {
                 * ((quality as u32) as f32)
     };
 
+    #[cfg(not(target_os = "android"))]
     println!();
 
     let configs = device
