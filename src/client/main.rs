@@ -49,7 +49,7 @@ struct Opt {
 enum StreamStatus {
     Starting,
     Streaming,
-    // Stopped,
+    Stopped,
 }
 
 async fn send_data(stream: &mut TcpStream, data: &[u8]) -> Result<()> {
@@ -241,31 +241,32 @@ async fn main_ex() -> Result<()> {
             .interact()?
     };
 
-    #[cfg(not(target_os = "android"))]
     let device = {
-        let output_devices: Vec<Device> = host
-            .output_devices()?
-            .filter(|x| x.name().is_ok())
-            .collect();
+        #[cfg(not(target_os = "android"))]
+        {
+            let output_devices: Vec<Device> = host
+                .output_devices()?
+                .filter(|x| x.name().is_ok())
+                .collect();
 
-        let devices_names = output_devices
-            .iter()
-            .map(|x| x.name().unwrap_or(String::new()))
-            .collect::<Vec<String>>();
+            let devices_names = output_devices
+                .iter()
+                .map(|x| x.name().unwrap_or(String::new()))
+                .collect::<Vec<String>>();
 
-        let selection = FuzzySelect::with_theme(&input_theme)
-            .with_prompt("Select the output device")
-            .default(0)
-            .items(&devices_names)
-            .interact()?;
+            let selection = FuzzySelect::with_theme(&input_theme)
+                .with_prompt("Select the output device")
+                .default(0)
+                .items(&devices_names)
+                .interact()?;
 
-        output_devices[selection].clone()
+            output_devices[selection].clone()
+        }
+
+        #[cfg(target_os = "android")]
+        host.default_output_device()
+            .ok_or(anyhow!("Could not find default output device"))?
     };
-
-    #[cfg(target_os = "android")]
-    let device = host
-        .default_output_device()
-        .ok_or(anyhow!("Could not find default output device"))?;
 
     println!();
 
@@ -364,7 +365,10 @@ async fn main_ex() -> Result<()> {
                 StreamStatus::Starting => {
                     cli.send(format!("START {client_id}").as_bytes()).await?;
                 }
-                StreamStatus::Streaming => {} // StreamStatus::Stopped => {}
+                StreamStatus::Streaming => {}
+                StreamStatus::Stopped => {
+                    break;
+                }
             };
 
             let recv_len = tokio::select! {
@@ -379,7 +383,7 @@ async fn main_ex() -> Result<()> {
                 },
                 result = close_rx_stream_receiver_task.changed() => {
                     if result.is_ok() && *close_rx_stream_receiver_task.borrow_and_update() {
-                        break;
+                        stream_status = StreamStatus::Stopped;
                     }
                     continue;
                 }
@@ -411,7 +415,10 @@ async fn main_ex() -> Result<()> {
                     } else {
                         error!("This should not happen");
                     }
-                } // StreamStatus::Stopped => {}
+                }
+                StreamStatus::Stopped => {
+                    break;
+                }
             };
         }
 
