@@ -241,8 +241,8 @@ async fn stream_server(
 
         let ret = vorbis_encode_init_vbr(
             vi.as_mut_ptr(),
-            config.channels() as i32,
-            config.sample_rate().0 as i32,
+            config.channels().into(),
+            (config.sample_rate().0 as i32).into(),
             quality,
         );
         if ret != 0 {
