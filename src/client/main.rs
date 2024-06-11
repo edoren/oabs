@@ -115,7 +115,7 @@ unsafe fn create_vorbis_file(
 }
 
 unsafe fn decode_part(
-    vf: *mut OggVorbis_File,
+    vf: &mut OggVorbis_File,
     out: &mut [&mut Caching<Arc<SharedRb<Heap<f32>>>, true, false>],
 ) -> Result<()> {
     let mut current_bitstream = Box::new(MaybeUninit::uninit());
@@ -403,8 +403,9 @@ async fn main_ex() -> Result<()> {
                 StreamStatus::Streaming => {
                     if let Some(vf) = &mut vorbis_file {
                         decode_producer.push_slice(&buf[..recv_len]);
-                        let result = unsafe { decode_part(vf.as_mut_ptr(), &mut [&mut producer]) };
-                        if let Err(e) = result {
+                        if let Err(e) =
+                            unsafe { decode_part(vf.assume_init_mut(), &mut [&mut producer]) }
+                        {
                             error!("Error Decoding Part: {e:?}");
                         }
                     } else {
