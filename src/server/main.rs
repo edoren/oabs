@@ -1,14 +1,9 @@
 use std::{
     collections::HashMap,
-    io::Write,
     mem::MaybeUninit,
     net::{Ipv4Addr, SocketAddr},
-    num::{NonZeroU32, NonZeroU8},
     slice,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        // mpsc::{self, Receiver},
-    },
+    sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
 };
 
@@ -29,7 +24,7 @@ use tokio::{
     net::{TcpListener, TcpStream, UdpSocket},
     signal,
     sync::{
-        mpsc::{self, Receiver, UnboundedReceiver},
+        mpsc::{self},
         watch,
     },
     task::{yield_now, JoinSet},
@@ -39,7 +34,6 @@ use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{
     filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
 };
-use vorbis_rs::{VorbisEncoderBuilder, VorbisError};
 
 enum ClientStatus {
     Connected { id: String },
@@ -202,6 +196,7 @@ async fn payload_server(
 
 async fn stream_server(
     server_addr: SocketAddr,
+    config: SupportedStreamConfig,
     mut data_send_rx: mpsc::UnboundedReceiver<Vec<f32>>,
     mut close_rx: watch::Receiver<bool>,
     mut client_status_rx: mpsc::Receiver<ClientStatus>,
@@ -210,13 +205,6 @@ async fn stream_server(
 
     let sock = UdpSocket::bind(server_addr).await?;
     debug!("Stream server listening on: {}", sock.local_addr()?);
-
-    let sample_rate = 48000;
-    let channels = 1;
-
-    let mut header_data: Vec<u8> = Vec::new();
-    let serial_num = rand::thread_rng().gen();
-    debug!("Serial: {}", serial_num);
 
     let mut os: Box<MaybeUninit<ogg_stream_state>> = Box::new(MaybeUninit::uninit());
     let mut og: Box<MaybeUninit<ogg_page>> = Box::new(MaybeUninit::uninit());
@@ -227,10 +215,16 @@ async fn stream_server(
     let mut vd: Box<MaybeUninit<vorbis_dsp_state>> = Box::new(MaybeUninit::uninit());
     let mut vb: Box<MaybeUninit<vorbis_block>> = Box::new(MaybeUninit::uninit());
 
+    let mut header_data: Vec<u8> = Vec::new();
     unsafe {
         vorbis_info_init(vi.as_mut_ptr());
 
-        let ret = vorbis_encode_init_vbr(vi.as_mut_ptr(), channels as i32, sample_rate as i32, 1.0);
+        let ret = vorbis_encode_init_vbr(
+            vi.as_mut_ptr(),
+            config.channels() as i32,
+            config.sample_rate().0 as i32,
+            0.1,
+        );
         if ret != 0 {
             panic!("YAY");
         }
@@ -241,6 +235,8 @@ async fn stream_server(
         vorbis_analysis_init(vd.as_mut_ptr(), vi.as_mut_ptr());
         vorbis_block_init(vd.as_mut_ptr(), vb.as_mut_ptr());
 
+        let serial_num = rand::thread_rng().gen();
+        debug!("Serial: {}", serial_num);
         ogg_stream_init(os.as_mut_ptr(), serial_num);
 
         {
@@ -321,16 +317,21 @@ async fn stream_server(
             yield_now().await;
         };
 
-        // if registered_clients.is_empty() {
-        //     continue;
-        // }
+        if registered_clients.is_empty() {
+            continue;
+        }
 
-        let audio_block = [raw_samples];
+        let audio_channels = unsafe { vi.assume_init_ref().channels as usize };
+
+        let mut audio_block: Vec<Vec<f32>> = Vec::new();
+        for _ in 0..audio_channels - 1 {
+            audio_block.push(raw_samples.clone());
+        }
+        audio_block.push(raw_samples);
 
         {
             let sample_count = audio_block[0].len();
             let encoder_buffer = unsafe {
-                let audio_channels = vi.assume_init_ref().channels as usize;
                 slice::from_raw_parts_mut(
                     vorbis_analysis_buffer(vd.as_mut_ptr(), sample_count.try_into()?),
                     audio_channels,
@@ -550,6 +551,7 @@ async fn main() -> Result<()> {
     let close_task = async move {
         signal::ctrl_c().await?;
         close_tx.send(true)?;
+        close_tx.closed().await;
         return Ok::<(), anyhow::Error>(());
     };
 
@@ -568,6 +570,7 @@ async fn main() -> Result<()> {
             _ = ctrl_shutdown_signal.recv() => { },
         }
         close_tx.send(true)?;
+        close_tx.closed().await;
         return Ok::<(), anyhow::Error>(());
     };
 
@@ -582,8 +585,9 @@ async fn main() -> Result<()> {
     let local_sdasd = tokio::task::LocalSet::new();
     let stream_joinh = local_sdasd.spawn_local(stream_server(
         server_addr,
+        config.clone(),
         data_send_rx,
-        close_rx.clone(),
+        close_rx,
         client_status_rx,
     ));
     let playback_capturer_joinh = local_sdasd.spawn_local(playback_capturer_task);
