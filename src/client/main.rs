@@ -89,10 +89,10 @@ unsafe fn decode_first_package(
     vd: &mut Box<MaybeUninit<vorbis_dsp_state>>,
     vb: &mut Box<MaybeUninit<vorbis_block>>,
 ) -> Result<()> {
-    let buffer_ptr = ogg_sync_buffer(oy.as_mut_ptr(), packet.len() as i32).cast::<u8>();
+    let buffer_ptr = ogg_sync_buffer(oy.as_mut_ptr(), packet.len().try_into()?).cast::<u8>();
     let decode_buffer = std::slice::from_raw_parts_mut(buffer_ptr, packet.len());
     decode_buffer[..packet.len()].copy_from_slice(packet);
-    ogg_sync_wrote(oy.as_mut_ptr(), packet.len() as i32);
+    ogg_sync_wrote(oy.as_mut_ptr(), packet.len().try_into()?);
 
     debug!("Header size: {}", packet.len());
 
@@ -205,10 +205,10 @@ unsafe fn decode_next_package<P: Producer<Item = f32>>(
 ) -> Result<()> {
     let convsize = 4096 / vi.assume_init_ref().channels;
 
-    let buffer_ptr = ogg_sync_buffer(oy.as_mut_ptr(), packet.len() as i32).cast::<u8>();
+    let buffer_ptr = ogg_sync_buffer(oy.as_mut_ptr(), packet.len().try_into()?).cast::<u8>();
     let decode_buffer = std::slice::from_raw_parts_mut(buffer_ptr, packet.len());
     decode_buffer[..packet.len()].copy_from_slice(packet);
-    ogg_sync_wrote(oy.as_mut_ptr(), packet.len() as i32);
+    ogg_sync_wrote(oy.as_mut_ptr(), packet.len().try_into()?);
 
     loop {
         let mut result = ogg_sync_pageout(oy.as_mut_ptr(), og.as_mut_ptr());

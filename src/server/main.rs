@@ -245,7 +245,7 @@ async fn stream_server(
         let ret = vorbis_encode_init_vbr(
             vi.as_mut_ptr(),
             config.channels().into(),
-            (config.sample_rate().0 as i32).into(),
+            config.sample_rate().0.try_into()?,
             quality,
         );
         if ret != 0 {
@@ -378,7 +378,7 @@ async fn stream_server(
                 }
             }
 
-            let res = unsafe { vorbis_analysis_wrote(vd.as_mut_ptr(), sample_count as i32) };
+            let res = unsafe { vorbis_analysis_wrote(vd.as_mut_ptr(), sample_count.try_into()?) };
             if res != 0 {
                 panic!("FUCK ERROR WRITE");
             }
