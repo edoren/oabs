@@ -138,7 +138,6 @@ unsafe fn decode_first_package(
             // Don't complain about missing or corrupt data yet. We'll
             // catch it at the packet output phase
             if result == 1 {
-                println!("Decoding here!");
                 ogg_stream_pagein(os.as_mut_ptr(), og.as_mut_ptr());
                 // We can ignore any errors here as they'll also become apparent at packetout
                 while i < 2 {
