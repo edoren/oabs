@@ -4,6 +4,7 @@ use std::{
     io,
     mem::MaybeUninit,
     net::{Ipv4Addr, SocketAddr},
+    process::ExitCode,
     slice,
     sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
@@ -235,7 +236,9 @@ async fn stream_server(
     let mut vd: Box<MaybeUninit<vorbis_dsp_state>> = Box::new(MaybeUninit::uninit());
     let mut vb: Box<MaybeUninit<vorbis_block>> = Box::new(MaybeUninit::uninit());
 
+    let serial_num;
     let mut header_data: Vec<u8> = Vec::new();
+
     unsafe {
         vorbis_info_init(vi.as_mut_ptr());
 
@@ -255,7 +258,7 @@ async fn stream_server(
         vorbis_analysis_init(vd.as_mut_ptr(), vi.as_mut_ptr());
         vorbis_block_init(vd.as_mut_ptr(), vb.as_mut_ptr());
 
-        let serial_num = thread_rng().gen();
+        serial_num = thread_rng().gen();
         debug!("Serial: {}", serial_num);
         ogg_stream_init(os.as_mut_ptr(), serial_num);
 
@@ -319,10 +322,12 @@ async fn stream_server(
         if let Ok((len, source)) = sock.try_recv_from(&mut buffer) {
             let msg = unsafe { std::str::from_utf8_unchecked(&buffer[..len]) };
             if msg.starts_with("START") {
-                let id = msg.split(" ").nth(1).unwrap();
-                registered_clients.insert(id.into(), Some(source));
-                info!("Added client {source} with id {id:?}");
-                let _len = sock.send_to(&header_data, source).await?;
+                if let Some(id) = msg.split(" ").nth(1) {
+                    registered_clients.insert(id.into(), Some(source));
+                    info!("Added client {source} with id {id:?}");
+                    let len = sock.send_to(&header_data, source).await?;
+                    info!("Sending header with size {len} and serial no {serial_num}");
+                }
             }
         }
 
@@ -440,8 +445,7 @@ async fn stream_server(
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+async fn main_wrapper() -> Result<()> {
     let opt = Opt::parse();
 
     let app_config_dir = dirs::config_dir()
@@ -501,7 +505,7 @@ async fn main() -> Result<()> {
 
             let devices_names = input_devices
                 .iter()
-                .map(|x| x.name().unwrap_or(String::new()))
+                .map(|x| x.name().unwrap_or_default())
                 .collect::<Vec<String>>();
 
             let selection = FuzzySelect::with_theme(&ColorfulTheme::default())
@@ -645,24 +649,23 @@ async fn main() -> Result<()> {
     ));
     let close_joinh = tokio::spawn(close_task);
 
-    let local_sdasd = tokio::task::LocalSet::new();
-    let stream_joinh = local_sdasd.spawn_local(stream_server(
-        server_addr,
-        quality_value,
-        config.clone(),
-        data_send_rx,
-        close_rx,
-        client_status_rx,
-    ));
-    let playback_capturer_joinh = local_sdasd.spawn_local(playback_capturer_task);
-
-    local_sdasd.await;
-
-    let (payload_res, close_res) = tokio::join!(payload_joinh, close_joinh);
-    if let Err(e) = stream_joinh.await {
+    let (payload_res, close_res, playback_capturer_res, stream_res) = tokio::join!(
+        payload_joinh,
+        close_joinh,
+        playback_capturer_task,
+        stream_server(
+            server_addr,
+            quality_value,
+            config.clone(),
+            data_send_rx,
+            close_rx,
+            client_status_rx,
+        )
+    );
+    if let Err(e) = stream_res {
         error!("{e:?}");
     }
-    if let Err(e) = playback_capturer_joinh.await {
+    if let Err(e) = playback_capturer_res {
         error!("{e:?}");
     }
     if let Err(e) = payload_res {
@@ -675,4 +678,14 @@ async fn main() -> Result<()> {
     debug!("Server closed successfully");
 
     Ok(())
+}
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    let result = main_wrapper().await;
+    if let Err(err) = &result {
+        error!("{err}");
+        return ExitCode::FAILURE;
+    }
+    return ExitCode::SUCCESS;
 }
