@@ -1,15 +1,13 @@
 use std::{
-    ffi::c_int,
     mem::MaybeUninit,
     net::{SocketAddr, ToSocketAddrs},
-    os::raw::c_void,
-    sync::Arc,
+    process::ExitCode,
     time::Duration,
 };
 
 use anyhow::{anyhow, Result};
 use aotuv_lancer_vorbis_sys::*;
-use clap::Parser;
+use clap::{ArgAction, Parser};
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     Device,
@@ -17,11 +15,10 @@ use cpal::{
 use dialoguer::{theme::ColorfulTheme, FuzzySelect, Input};
 use log::{debug, error, info, trace};
 use oabs_lib::{OABSMessage, SupportedStreamConfigDeserialize};
+use ogg_next_sys::*;
 use ringbuf::{
-    storage::Heap,
     traits::{Consumer, Producer, Split},
-    wrap::caching::Caching,
-    HeapRb, SharedRb,
+    HeapRb,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -34,6 +31,9 @@ use tracing_subscriber::{
     filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
 };
 
+const MIN_LATENCY: i64 = 50;
+const MAX_LATENCY: i64 = 500;
+
 #[derive(Parser, Debug)]
 #[command(version, about = "Client", long_about = None)]
 struct Opt {
@@ -41,9 +41,19 @@ struct Opt {
     #[arg(short, long, value_name = "SERVER")]
     server: Option<String>,
 
-    /// Specify the delay between input and output
-    #[arg(short, long, value_name = "DELAY_MS")]
-    latency: Option<f32>,
+    #[arg(short, long,
+          help = format!("Specify the delay between input and output in milliseconds [{MIN_LATENCY}, {MAX_LATENCY}]"),
+          value_name = "DELAY_MS", value_parser = clap::value_parser!(u32).range(MIN_LATENCY..=MAX_LATENCY))]
+    latency: Option<u32>,
+
+    /// Specify the volume [0, 100]
+    #[arg(short, long, value_name = "VOLUME", value_parser = clap::value_parser!(u32).range(0..=100))]
+    volume: Option<u32>,
+
+    /// Use the default device to play music
+    #[cfg(not(target_os = "android"))]
+    #[arg(long, action = ArgAction::SetTrue)]
+    default_device: bool,
 }
 
 enum StreamStatus {
@@ -65,95 +75,206 @@ async fn recv_data(stream: &mut TcpStream) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-unsafe fn create_vorbis_file(
-    source: *mut ::std::os::raw::c_void,
-) -> Result<Box<MaybeUninit<OggVorbis_File>>> {
-    let mut vf: Box<MaybeUninit<OggVorbis_File>> = Box::new(MaybeUninit::uninit());
-    let callbacks = ov_callbacks {
-        read_func: {
-            // This read callback should match the stdio fread behavior.
-            // See: https://man7.org/linux/man-pages/man3/fread.3p.html
-            unsafe extern "C" fn read_func(
-                ptr: *mut c_void,
-                size: usize,
-                count: usize,
-                datasource: *mut c_void,
-            ) -> usize {
-                let source =
-                    &mut *(datasource.cast::<Caching<Arc<SharedRb<Heap<u8>>>, false, true>>());
-                let buf = std::slice::from_raw_parts_mut(ptr.cast(), size * count);
-                let ret = source.pop_slice(buf);
-                return ret;
-            }
-            Some(read_func)
-        },
-        seek_func: None,
-        close_func: {
-            unsafe extern "C" fn close_func(datasource: *mut c_void) -> c_int {
-                // Drop the Read when it's no longer needed by vorbisfile.
-                // This is called by ov_clear
-                drop(Box::from_raw(datasource.cast::<Caching<
-                    Arc<SharedRb<Heap<u8>>>,
-                    false,
-                    true,
-                >>()));
-                0
-            }
-            Some(close_func)
-        },
-        tell_func: None,
-    };
+unsafe fn decode_first_package(
+    packet: &[u8],
+    oy: &mut Box<MaybeUninit<ogg_sync_state>>,
+    os: &mut Box<MaybeUninit<ogg_stream_state>>,
 
-    let res = ov_open_callbacks(source, vf.as_mut_ptr(), std::ptr::null(), 0, callbacks);
-    if res != 0 {
-        Err(anyhow!(
-            "Could not create OggVorbis instance. Error code: {res}"
-        ))
-    } else {
-        Ok(vf)
+    og: &mut Box<MaybeUninit<ogg_page>>,
+    op: &mut Box<MaybeUninit<ogg_packet>>,
+
+    vi: &mut Box<MaybeUninit<vorbis_info>>,
+
+    vc: &mut Box<MaybeUninit<vorbis_comment>>,
+    vd: &mut Box<MaybeUninit<vorbis_dsp_state>>,
+    vb: &mut Box<MaybeUninit<vorbis_block>>,
+) -> Result<()> {
+    let buffer_ptr = ogg_sync_buffer(oy.as_mut_ptr(), packet.len() as i32).cast::<u8>();
+    let decode_buffer = std::slice::from_raw_parts_mut(buffer_ptr, packet.len());
+    decode_buffer[..packet.len()].copy_from_slice(packet);
+    ogg_sync_wrote(oy.as_mut_ptr(), packet.len() as i32);
+
+    debug!("Header size: {}", packet.len());
+
+    /* Get the first page. */
+    if ogg_sync_pageout(oy.as_mut_ptr(), og.as_mut_ptr()) != 1 {
+        return Err(anyhow!("Input does not appear to be an Ogg bitstream."));
     }
+
+    let serial_no = ogg_page_serialno(og.as_mut_ptr());
+    debug!("Serial number found: {serial_no}");
+    ogg_stream_init(os.as_mut_ptr(), serial_no);
+
+    if ogg_stream_pagein(os.as_mut_ptr(), og.as_mut_ptr()) != 0 {
+        return Err(anyhow!("Error reading first page of Ogg bitstream data."));
+    }
+
+    if ogg_stream_packetout(os.as_mut_ptr(), op.as_mut_ptr()) != 1 {
+        return Err(anyhow!("Error reading initial header packet."));
+    }
+
+    if vorbis_synthesis_idheader(op.as_mut_ptr()) != 1 {
+        return Err(anyhow!("This is not a valid Vorbis first packet."));
+    }
+
+    vorbis_info_init(vi.as_mut_ptr());
+    vorbis_comment_init(vc.as_mut_ptr());
+
+    if vorbis_synthesis_headerin(vi.as_mut_ptr(), vc.as_mut_ptr(), op.as_mut_ptr()) < 0 {
+        return Err(anyhow!(
+            "This Ogg bitstream does not contain Vorbis audio data."
+        ));
+    }
+
+    let mut i = 0;
+
+    while i < 2 {
+        while i < 2 {
+            let mut result = ogg_sync_pageout(oy.as_mut_ptr(), og.as_mut_ptr());
+            if result == 0 {
+                break;
+            }
+
+            // Don't complain about missing or corrupt data yet. We'll
+            // catch it at the packet output phase
+            if result == 1 {
+                println!("Decoding here!");
+                ogg_stream_pagein(os.as_mut_ptr(), og.as_mut_ptr());
+                // We can ignore any errors here as they'll also become apparent at packetout
+                while i < 2 {
+                    result = ogg_stream_packetout(os.as_mut_ptr(), op.as_mut_ptr());
+                    if result == 0 {
+                        break;
+                    }
+                    if result < 0 {
+                        // Uh oh; data at some point was corrupted or missing!
+                        // We can't tolerate that in a header. Die.
+                        return Err(anyhow!("Corrupt secondary header. Exiting."));
+                    }
+                    result = vorbis_synthesis_headerin(
+                        vi.as_mut_ptr(),
+                        vc.as_mut_ptr(),
+                        op.as_mut_ptr(),
+                    );
+                    if result < 0 {
+                        return Err(anyhow!("Corrupt secondary header. Exiting."));
+                    }
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    {
+        // let ptr = vc.assume_init_ref().user_comments;
+        // ptr.user_comments
+        // while(*ptr){
+        //   error!("%s\n",*ptr);
+        //   ++ptr;
+        // }
+        let vi_ref = vi.assume_init_ref();
+        let vc_ref = vc.assume_init_ref();
+        debug!(
+            "Bitstream is {} channel, {}Hz",
+            vi_ref.channels, vi_ref.rate
+        );
+        let vendor = std::ffi::CStr::from_ptr(vc_ref.vendor);
+        debug!("Encoded by: {}", vendor.to_str()?);
+    }
+
+    vorbis_synthesis_init(vd.as_mut_ptr(), vi.as_mut_ptr());
+    vorbis_block_init(vd.as_mut_ptr(), vb.as_mut_ptr());
+
+    Ok(())
 }
 
-unsafe fn decode_part(
-    vf: &mut OggVorbis_File,
-    out: &mut [&mut Caching<Arc<SharedRb<Heap<f32>>>, true, false>],
+unsafe fn decode_next_package<P: Producer<Item = f32>>(
+    packet: &[u8],
+    oy: &mut Box<MaybeUninit<ogg_sync_state>>,
+    os: &mut Box<MaybeUninit<ogg_stream_state>>,
+
+    og: &mut Box<MaybeUninit<ogg_page>>,
+    op: &mut Box<MaybeUninit<ogg_packet>>,
+
+    vi: &mut Box<MaybeUninit<vorbis_info>>,
+
+    // vc: &mut Box<MaybeUninit<vorbis_comment>>,
+    vd: &mut Box<MaybeUninit<vorbis_dsp_state>>,
+    vb: &mut Box<MaybeUninit<vorbis_block>>,
+
+    producer: &mut P,
 ) -> Result<()> {
-    let mut current_bitstream = Box::new(MaybeUninit::uninit());
-    let mut sample_buf = Box::new(MaybeUninit::uninit());
+    let convsize = 4096 / vi.assume_init_ref().channels;
+
+    let buffer_ptr = ogg_sync_buffer(oy.as_mut_ptr(), packet.len() as i32).cast::<u8>();
+    let decode_buffer = std::slice::from_raw_parts_mut(buffer_ptr, packet.len());
+    decode_buffer[..packet.len()].copy_from_slice(packet);
+    ogg_sync_wrote(oy.as_mut_ptr(), packet.len() as i32);
 
     loop {
-        let samples_read = ov_read_float(
-            vf,
-            sample_buf.as_mut_ptr(),
-            2048,
-            current_bitstream.as_mut_ptr(),
-        );
-
-        if samples_read <= 0 {
-            return Ok(());
+        let mut result = ogg_sync_pageout(oy.as_mut_ptr(), og.as_mut_ptr());
+        if result == 0 {
+            break;
         }
 
-        if samples_read > 0 {
-            if current_bitstream.assume_init_read() != 0 {
-                return Err(anyhow!("VorbisError::UnsupportedStreamChaining"));
-            }
+        if result < 0 {
+            // Missing or corrupt data at this page position
+            error!("Corrupt or missing data in bitstream; continuing...");
+            break;
+        } else {
+            // Can safely ignore errors at this point
+            ogg_stream_pagein(os.as_mut_ptr(), og.as_mut_ptr());
 
-            let buf: *mut *mut f32 = sample_buf.assume_init_read();
-            let channels = (*(*vf).vi).channels as usize;
-            let samples_read = samples_read as usize;
+            loop {
+                result = ogg_stream_packetout(os.as_mut_ptr(), op.as_mut_ptr());
 
-            let mut values = std::slice::from_raw_parts(buf, channels)
-                .iter()
-                .map(|channel_samples| std::slice::from_raw_parts(*channel_samples, samples_read));
+                if result == 0 {
+                    break;
+                }
 
-            for i in 0..out.len() {
-                out[0].push_slice(values.nth(i).unwrap_or(&[]));
+                if result < 0 {
+                    // Missing or corrupt data at this page position
+                    // no reason to complain; already complained above
+                } else {
+                    // We have a packet. Decode it
+                    if vorbis_synthesis(vb.as_mut_ptr(), op.as_mut_ptr()) == 0 {
+                        vorbis_synthesis_blockin(vd.as_mut_ptr(), vb.as_mut_ptr());
+                    }
+
+                    // pcm is a multichannel float vector. In stereo, for example, pcm[0] is left,
+                    // and pcm[1] is right. samples is the size of each channel. Convert the float
+                    // values (-1.0 <= range <= 1.0) to whatever PCM format and write it out
+                    let mut pcm: *mut *mut f32 = std::ptr::null_mut();
+                    loop {
+                        let samples = vorbis_synthesis_pcmout(vd.as_mut_ptr(), &mut pcm);
+                        if samples == 0 {
+                            break;
+                        }
+
+                        let bout = std::cmp::min(samples, convsize);
+
+                        // Get the channel 1
+                        let mono = *pcm.offset(0);
+                        let data = std::slice::from_raw_parts(mono, bout as usize);
+
+                        producer.push_slice(data);
+
+                        // Tell libvorbis how many samples we actually consumed
+                        vorbis_synthesis_read(vd.as_mut_ptr(), bout);
+                    }
+                }
             }
         }
+
+        if ogg_page_eos(og.as_mut_ptr()) > 0 {
+            break;
+        };
     }
+
+    Ok(())
 }
 
-async fn main_ex() -> Result<()> {
+async fn main_wrapper() -> Result<()> {
     let opt = Opt::parse();
 
     let app_config_dir = dirs::config_dir()
@@ -237,13 +358,36 @@ async fn main_ex() -> Result<()> {
     } else {
         Input::with_theme(&input_theme)
             .with_prompt("Enter the latency")
-            .default(150.0)
-            .interact()?
+            .default(150)
+            .validate_with(|val: &i64| -> Result<(), &str> {
+                if *val >= MIN_LATENCY && *val <= MAX_LATENCY {
+                    Ok(())
+                } else {
+                    Err("Volume should be between 0 and 100")
+                }
+            })
+            .interact()? as u32
+    };
+
+    let volume = if let Some(volume) = opt.volume {
+        volume
+    } else {
+        Input::with_theme(&input_theme)
+            .with_prompt("Enter the volume")
+            .default(100)
+            .validate_with(|val: &i32| -> Result<(), &str> {
+                if *val >= 0 && *val <= 100 {
+                    Ok(())
+                } else {
+                    Err("Volume should be between 0 and 100")
+                }
+            })
+            .interact()? as u32
     };
 
     let device = {
         #[cfg(not(target_os = "android"))]
-        {
+        if !opt.default_device {
             let output_devices: Vec<Device> = host
                 .output_devices()?
                 .filter(|x| x.name().is_ok())
@@ -251,7 +395,7 @@ async fn main_ex() -> Result<()> {
 
             let devices_names = output_devices
                 .iter()
-                .map(|x| x.name().unwrap_or(String::new()))
+                .map(|x| x.name().unwrap_or_default())
                 .collect::<Vec<String>>();
 
             let selection = FuzzySelect::with_theme(&input_theme)
@@ -261,6 +405,9 @@ async fn main_ex() -> Result<()> {
                 .interact()?;
 
             output_devices[selection].clone()
+        } else {
+            host.default_output_device()
+                .ok_or(anyhow!("Could not find default output device"))?
         }
 
         #[cfg(target_os = "android")]
@@ -319,7 +466,7 @@ async fn main_ex() -> Result<()> {
     debug!("Receiving config {:?}", config);
 
     // Create a delay in case the input and output devices aren't synced.
-    let latency_frames = (latency / 1_000.0) * config.sample_rate().0 as f32;
+    let latency_frames = (latency as f32 / 1_000.0) * config.sample_rate().0 as f32;
     let latency_samples = latency_frames as usize * config.channels() as usize;
 
     // The buffer to share samples
@@ -353,11 +500,21 @@ async fn main_ex() -> Result<()> {
         cli.connect(remote_addr).await?;
         let mut buf = [0; 10240];
 
-        let decode_ring = HeapRb::<u8>::new(5400);
-        let (mut decode_producer, decode_consumer) = decode_ring.split();
-        let source = Box::into_raw(decode_consumer.into());
+        let mut oy: Box<MaybeUninit<ogg_sync_state>> = Box::new(MaybeUninit::uninit());
+        let mut os: Box<MaybeUninit<ogg_stream_state>> = Box::new(MaybeUninit::uninit());
 
-        let mut vorbis_file: Option<Box<MaybeUninit<OggVorbis_File>>> = None;
+        let mut og: Box<MaybeUninit<ogg_page>> = Box::new(MaybeUninit::uninit());
+        let mut op: Box<MaybeUninit<ogg_packet>> = Box::new(MaybeUninit::uninit());
+
+        let mut vi: Box<MaybeUninit<vorbis_info>> = Box::new(MaybeUninit::uninit());
+
+        let mut vc: Box<MaybeUninit<vorbis_comment>> = Box::new(MaybeUninit::uninit());
+        let mut vd: Box<MaybeUninit<vorbis_dsp_state>> = Box::new(MaybeUninit::uninit());
+        let mut vb: Box<MaybeUninit<vorbis_block>> = Box::new(MaybeUninit::uninit());
+
+        unsafe {
+            ogg_sync_init(oy.as_mut_ptr());
+        };
 
         let mut stream_status = StreamStatus::Starting;
         loop {
@@ -391,39 +548,50 @@ async fn main_ex() -> Result<()> {
 
             match stream_status {
                 StreamStatus::Starting => {
-                    decode_producer.push_slice(&buf[..recv_len]);
-
-                    match unsafe { create_vorbis_file(source.cast()) } {
-                        Ok(vf) => {
-                            vorbis_file = Some(vf);
-                        }
-                        Err(e) => {
-                            error!("Error creating Vorbis File: {e:?} - Header Buffer: {recv_len}");
-                        }
+                    unsafe {
+                        decode_first_package(
+                            &buf[..recv_len],
+                            &mut oy,
+                            &mut os,
+                            &mut og,
+                            &mut op,
+                            &mut vi,
+                            &mut vc,
+                            &mut vd,
+                            &mut vb,
+                        )?;
                     }
-
                     stream_status = StreamStatus::Streaming;
                 }
-                StreamStatus::Streaming => {
-                    if let Some(vf) = &mut vorbis_file {
-                        decode_producer.push_slice(&buf[..recv_len]);
-                        if let Err(e) =
-                            unsafe { decode_part(vf.assume_init_mut(), &mut [&mut producer]) }
-                        {
-                            error!("Error Decoding Part: {e:?}");
-                        }
-                    } else {
-                        error!("This should not happen");
-                    }
-                }
+                StreamStatus::Streaming => unsafe {
+                    decode_next_package(
+                        &buf[..recv_len],
+                        &mut oy,
+                        &mut os,
+                        &mut og,
+                        &mut op,
+                        &mut vi,
+                        // &mut vc,
+                        &mut vd,
+                        &mut vb,
+                        &mut producer,
+                    )?;
+                },
                 StreamStatus::Stopped => {
                     break;
                 }
             };
         }
 
-        if let Some(vf) = &mut vorbis_file {
-            unsafe { ov_clear(vf.as_mut_ptr()) };
+        unsafe {
+            vorbis_block_clear(vb.as_mut_ptr());
+            vorbis_dsp_clear(vd.as_mut_ptr());
+
+            ogg_stream_clear(os.as_mut_ptr());
+            vorbis_comment_clear(vc.as_mut_ptr());
+            vorbis_info_clear(vi.as_mut_ptr());
+
+            ogg_sync_clear(oy.as_mut_ptr());
         }
 
         debug!("Closing stream receiver task");
@@ -439,9 +607,11 @@ async fn main_ex() -> Result<()> {
         let playback_stream = device_clone.build_output_stream(
             &config_clone.into(),
             move |data: &mut [f32], _: &_| {
-                let received_count = data.len();
+                let requested_count = data.len();
                 let read_count = consumer.pop_slice(data);
-                if read_count < received_count {
+                data.iter_mut()
+                    .for_each(|s| *s = *s * volume as f32 / 100.0);
+                if read_count < requested_count {
                     trace!("input stream fell behind: try increasing latency");
                 }
             },
@@ -457,7 +627,7 @@ async fn main_ex() -> Result<()> {
                     break;
                 }
             }
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(50));
         }
         debug!("Stopping playback");
         playback_stream.pause()?;
@@ -554,11 +724,11 @@ async fn main_ex() -> Result<()> {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    let result = main_ex().await;
-    if let Err(err) = result {
+async fn main() -> ExitCode {
+    let result = main_wrapper().await;
+    if let Err(err) = &result {
         error!("{err}");
-        return Err(err);
+        return ExitCode::FAILURE;
     }
-    Ok(())
+    return ExitCode::SUCCESS;
 }
