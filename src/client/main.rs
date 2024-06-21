@@ -495,8 +495,10 @@ async fn main_wrapper() -> Result<()> {
 
         let local_addr: SocketAddr = "0.0.0.0:12312".parse()?;
         let cli = UdpSocket::bind(local_addr).await?;
-        debug!("Using local address: {}", cli.local_addr()?);
         cli.connect(remote_addr).await?;
+
+        debug!("Using local address: {}", cli.local_addr()?);
+
         let mut buf = [0; 10240];
 
         let mut oy: Box<MaybeUninit<ogg_sync_state>> = Box::new(MaybeUninit::uninit());
@@ -519,7 +521,7 @@ async fn main_wrapper() -> Result<()> {
         loop {
             match stream_status {
                 StreamStatus::Starting => {
-                    cli.send(format!("START {client_id}").as_bytes()).await?;
+                    cli.send("START".as_bytes()).await?;
                 }
                 StreamStatus::Streaming => {}
                 StreamStatus::Stopped => {
@@ -560,6 +562,7 @@ async fn main_wrapper() -> Result<()> {
                             &mut vb,
                         )?;
                     }
+                    let _ = cli.send(format!("HEADER_OK {client_id}").as_bytes()).await;
                     stream_status = StreamStatus::Streaming;
                 }
                 StreamStatus::Streaming => unsafe {
@@ -599,7 +602,7 @@ async fn main_wrapper() -> Result<()> {
 
     let config_clone = config.clone();
     let device_clone = device.clone();
-    let mut player_close_rx = close_rx;
+    let mut player_close_rx = close_rx.clone();
     let player_task = move || {
         debug!("Starting player task");
 
@@ -637,45 +640,83 @@ async fn main_wrapper() -> Result<()> {
         Ok::<(), anyhow::Error>(())
     };
 
+    let server_receiver_close_tx = close_tx.clone();
+    let mut server_receiver_close_rx = close_rx.clone();
     let server_receiver = async move {
         debug!("Starting server connection task");
 
-        loop {
-            if let Ok(data) = recv_data(&mut stream).await {
-                let value = match std::str::from_utf8(&data) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
+        let mut close_requested = false;
 
-                if value == "PING" {
-                    trace!("PING");
-                    loop {
-                        if let Err(e) = send_data(&mut stream, "PONG".as_bytes()).await {
-                            debug!("Error Sending Pong: {e:?}");
-                        } else {
-                            trace!("PONG");
-                            break;
-                        }
+        loop {
+            let data = tokio::select! {
+                result = recv_data(&mut stream) => {
+                    match result {
+                        Ok(data) => data,
+                        Err(e) => {
+                            error!("{e:?}");
+                            continue;
+                        },
+                    }
+                },
+                result = server_receiver_close_rx.changed() => {
+                    if result.is_ok() && *server_receiver_close_rx.borrow_and_update() {
+                        close_requested = true;
+                        vec![]
+                    } else {
+                        error!("Error getting close signal");
+                        continue;
                     }
                 }
-                if value == "CLOSE" {
-                    debug!("Server requested close");
-                    break;
+            };
+
+            if close_requested {
+                if let Err(e) = send_data(&mut stream, "CLOSE".as_bytes()).await {
+                    error!("Failed to send CLOSE: {e:?}");
                 }
+                break;
+            }
+
+            let value = match std::str::from_utf8(&data) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            if value == "PING" {
+                trace!("PING");
+                loop {
+                    if let Err(e) = send_data(&mut stream, "PONG".as_bytes()).await {
+                        debug!("Error Sending Pong: {e:?}");
+                    } else {
+                        trace!("PONG");
+                        break;
+                    }
+                }
+            }
+            if value == "CLOSE" {
+                debug!("Server requested close");
+                break;
             }
         }
 
+        drop(server_receiver_close_rx);
+        server_receiver_close_tx.send(true)?;
+
         debug!("Stopping server connection task");
+
+        Ok::<(), anyhow::Error>(())
     };
+
+    let close_task_close_tx = close_tx.clone();
+    let mut close_task_close_rx = close_rx;
 
     #[cfg(not(target_os = "windows"))]
     let close_task = async move {
         tokio::select! {
             _ = signal::ctrl_c() => { },
-            _ = server_receiver => { }
+            _ = close_task_close_rx.changed() => { },
+
         };
         close_tx.send(true)?;
-        close_tx.closed().await;
         return Ok::<(), anyhow::Error>(());
     };
 
@@ -692,10 +733,10 @@ async fn main_wrapper() -> Result<()> {
             _ = ctrl_break_signal.recv() => { },
             _ = ctrl_logoff_signal.recv() => { },
             _ = ctrl_shutdown_signal.recv() => { },
-            _ = server_receiver => { }
+            _ = close_task_close_rx.changed() => { },
         }
-        close_tx.send(true)?;
-        close_tx.closed().await;
+        drop(close_task_close_rx);
+        close_task_close_tx.send(true)?;
         return Ok::<(), anyhow::Error>(());
     };
 
@@ -703,7 +744,8 @@ async fn main_wrapper() -> Result<()> {
 
     let player_joinh = std::thread::spawn(player_task);
 
-    let (close_res, stream_receiver_res) = tokio::join!(close_joinh, stream_receiver_task);
+    let (close_res, stream_receiver_res, server_receiver_res) =
+        tokio::join!(close_joinh, stream_receiver_task, server_receiver);
 
     let player_res = player_joinh.join();
 
@@ -716,6 +758,11 @@ async fn main_wrapper() -> Result<()> {
     if let Err(e) = stream_receiver_res {
         error!("{e:?}");
     };
+    if let Err(e) = server_receiver_res {
+        error!("{e:?}");
+    };
+
+    close_tx.closed().await;
 
     info!("Client closed successfully");
 
