@@ -716,7 +716,7 @@ async fn main_wrapper() -> Result<()> {
             _ = close_task_close_rx.changed() => { },
 
         };
-        close_tx.send(true)?;
+        close_task_close_tx.send(true)?;
         return Ok::<(), anyhow::Error>(());
     };
 
