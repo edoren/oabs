@@ -1,7 +1,7 @@
 use std::{
     cmp::Eq,
     collections::HashMap,
-    io,
+    io::{self, ErrorKind},
     mem::MaybeUninit,
     net::{Ipv4Addr, SocketAddr},
     process::ExitCode,
@@ -27,12 +27,9 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
     signal,
-    sync::{
-        mpsc::{self},
-        watch,
-    },
+    sync::{mpsc, watch},
     task::{yield_now, JoinSet},
-    time::{sleep, timeout_at, Instant},
+    time::{sleep_until, timeout_at, Instant},
 };
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{
@@ -111,51 +108,63 @@ async fn client_handler(
         .await;
 
     let client_task = async {
-        let mut pong_instant = Instant::now() + Duration::from_secs(10);
+        let instanto = Instant::now();
+        let mut ping_timeout = instanto + Duration::from_secs(5);
+        let mut pong_deadline = instanto + Duration::from_secs(10);
+
         loop {
-            match send_data(&mut stream, "PING".as_bytes()).await {
-                Ok(_) => {
-                    trace!("Sending PING to client with id {client_id:?}")
-                }
-                Err(e) => match e.kind() {
-                    io::ErrorKind::ConnectionAborted | io::ErrorKind::ConnectionReset => {
-                        info!("Connection aborted from client {client_id}");
-                        break;
-                    }
-                    _ => {
-                        error!("Error sending PING from client with id {client_id:?}: {e:?}");
+            tokio::select! {
+                _ = sleep_until(ping_timeout) => {
+                    match send_data(&mut stream, "PING".as_bytes()).await {
+                        Ok(_) => {
+                            trace!("Sending PING to client with id {client_id:?}");
+                            ping_timeout = Instant::now() + Duration::from_secs(5);
+                        }
+                        Err(e) => match e.kind() {
+                            io::ErrorKind::ConnectionAborted | io::ErrorKind::ConnectionReset => {
+                                info!("Connection aborted from client {client_id}");
+                                break;
+                            }
+                            _ => {
+                                error!("Error sending PING from client with id {client_id:?}: {e:?}");
+                            }
+                        },
                     }
                 },
-            }
+                result = timeout_at(pong_deadline, recv_data(&mut stream)) => {
+                    let read_result = match result {
+                        Ok(result) => result,
+                        Err(_) => {
+                            info!("Client with id {client_id:?} forgot to PONG");
+                            break;
+                        }
+                    };
 
-            let read_result = match timeout_at(pong_instant, recv_data(&mut stream)).await {
-                Ok(result) => result,
-                Err(_) => {
-                    info!("Client with id {client_id:?} forgot to PONG");
-                    break;
-                }
-            };
-
-            match read_result {
-                Err(e) => {
-                    if e.kind() == io::ErrorKind::UnexpectedEof {
-                        info!("Connection aborted from client with id {client_id:?}");
-                        break;
-                    }
-                }
-                Ok(data) => {
-                    if data.len() == 0 {
-                        debug!("Empty data frame for client with id {client_id:?}. Closing.");
-                        break;
-                    }
-                    if let Ok(value) = std::str::from_utf8(&data) {
-                        if value == "PONG" {
-                            sleep(Duration::from_secs(5)).await;
-                            pong_instant = Instant::now() + Duration::from_secs(10);
+                    match read_result {
+                        Err(e) => {
+                            if e.kind() == io::ErrorKind::UnexpectedEof {
+                                info!("Connection aborted from client with id {client_id:?}");
+                                break;
+                            }
+                        }
+                        Ok(data) => {
+                            if data.len() == 0 {
+                                debug!("Empty data frame for client with id {client_id:?}. Closing.");
+                                break;
+                            }
+                            if let Ok(value) = std::str::from_utf8(&data) {
+                                if value == "PONG" {
+                                    trace!("Received PONG from client with id {client_id:?}");
+                                    pong_deadline = Instant::now() + Duration::from_secs(10);
+                                }
+                                if value == "CLOSE" {
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
-            }
+            };
         }
     };
 
@@ -297,9 +306,12 @@ async fn stream_server(
 
     debug!("Header Data: {}", header_data.len());
 
-    let mut buffer = [0; 8];
+    let mut buffer = [0; 256];
     let mut encoded_data: Vec<u8> = Vec::new();
     let mut registered_clients: HashMap<String, Option<SocketAddr>> = HashMap::new();
+
+    let mut client_detected = false;
+
     'stream_loop: loop {
         if let Ok(changed) = close_rx.has_changed() {
             if changed && *close_rx.borrow_and_update() {
@@ -315,18 +327,28 @@ async fn stream_server(
                 ClientStatus::Disconnected { id } => {
                     registered_clients.remove(&id);
                     info!("Removing client with id {id:?}");
+                    client_detected = !registered_clients.is_empty();
                 }
             }
         }
 
-        if let Ok((len, source)) = sock.try_recv_from(&mut buffer) {
-            let msg = unsafe { std::str::from_utf8_unchecked(&buffer[..len]) };
-            if msg.starts_with("START") {
-                if let Some(id) = msg.split(" ").nth(1) {
-                    registered_clients.insert(id.into(), Some(source));
-                    info!("Added client {source} with id {id:?}");
-                    let len = sock.send_to(&header_data, source).await?;
-                    info!("Sending header with size {len} and serial no {serial_num}");
+        match sock.try_recv_from(&mut buffer) {
+            Ok((len, source)) => {
+                let msg = unsafe { std::str::from_utf8_unchecked(&buffer[..len]) };
+                if msg == "START" {
+                    let _ = sock.send_to(&header_data, source).await?;
+                }
+                if msg.starts_with("HEADER_OK") {
+                    if let Some(id) = msg.split(" ").nth(1) {
+                        client_detected = true;
+                        registered_clients.insert(id.into(), Some(source));
+                        info!("Added client {source} with id {id:?}");
+                    }
+                }
+            }
+            Err(e) => {
+                if e.kind() != ErrorKind::WouldBlock {
+                    error!("{e}");
                 }
             }
         }
@@ -342,7 +364,7 @@ async fn stream_server(
             yield_now().await;
         };
 
-        if registered_clients.is_empty() {
+        if registered_clients.is_empty() || !client_detected {
             continue;
         }
 
