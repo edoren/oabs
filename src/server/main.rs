@@ -12,7 +12,7 @@ use std::{
 
 use anyhow::{anyhow, Result};
 use aotuv_lancer_vorbis_sys::*;
-use clap::{Parser, ValueEnum};
+use clap::{ArgAction, Parser, ValueEnum};
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     Device, SampleFormat, SampleRate, SupportedStreamConfig,
@@ -70,6 +70,10 @@ struct Opt {
     #[cfg(not(target_os = "android"))]
     #[arg(short, long, value_name = "DEVICE")]
     device: Option<String>,
+
+    /// The device to capture audio from
+    #[arg(short, long, action = ArgAction::SetTrue)]
+    list_devices: bool,
 }
 
 async fn send_data(stream: &mut TcpStream, data: &[u8]) -> Result<(), io::Error> {
@@ -512,6 +516,20 @@ async fn main_wrapper() -> Result<()> {
 
     // App
 
+    let server_addr = SocketAddr::new(Ipv4Addr::new(0, 0, 0, 0).into(), opt.port);
+
+    let host = cpal::default_host();
+    let devices: Vec<Device> = host.devices()?.filter(|x| x.name().is_ok()).collect();
+    let devices_names = devices
+        .iter()
+        .map(|x| x.name().unwrap_or_default())
+        .collect::<Vec<String>>();
+
+    if opt.list_devices {
+        devices_names.iter().for_each(|dn| println!("{dn}"));
+        return Ok(());
+    }
+
     eprintln!(" ██████╗  █████╗ ██████╗ ███████╗");
     eprintln!("██╔═══██╗██╔══██╗██╔══██╗██╔════╝");
     eprintln!("██║   ██║███████║██████╔╝███████╗");
@@ -521,53 +539,41 @@ async fn main_wrapper() -> Result<()> {
     eprintln!("[ Open Audio Broadcast Software ]");
     eprintln!();
 
-    let server_addr = SocketAddr::new(Ipv4Addr::new(0, 0, 0, 0).into(), opt.port);
-    let host = cpal::default_host();
-
     // CLI UI
 
     let mut additional_space = false;
 
-    let device = {
+    let device_name = if let Some(device_name) = opt.device {
+        let device_found = devices_names.iter().find(|&d| d == &device_name);
+        if let Some(device_name) = device_found {
+            device_name.clone()
+        } else {
+            return Err(anyhow!("Could not find a device with name {device_name}"));
+        }
+    } else {
         #[cfg(not(target_os = "android"))]
         {
-            let input_devices: Vec<Device> =
-                host.input_devices()?.filter(|x| x.name().is_ok()).collect();
+            additional_space = true;
+            let selection = FuzzySelect::with_theme(&ColorfulTheme::default())
+                .with_prompt("Select the device to capture")
+                .default(0)
+                .items(&devices_names)
+                .interact()?;
 
-            let devices_names = input_devices
-                .iter()
-                .map(|x| x.name().unwrap_or_default())
-                .collect::<Vec<String>>();
-
-            let selection = if let Some(device_name) = opt.device {
-                let device_found = devices_names.iter().enumerate().find_map(|(i, d)| {
-                    if d == &device_name {
-                        Some(i)
-                    } else {
-                        None
-                    }
-                });
-                if let Some(selected_index) = device_found {
-                    selected_index
-                } else {
-                    return Err(anyhow!("Could not find a device with name {device_name}"));
-                }
-            } else {
-                additional_space = true;
-                FuzzySelect::with_theme(&ColorfulTheme::default())
-                    .with_prompt("Select the device to capture")
-                    .default(0)
-                    .items(&devices_names)
-                    .interact()?
-            };
-
-            input_devices[selection].clone()
+            devices_names[selection].clone()
         }
 
         #[cfg(target_os = "android")]
         host.default_input_device()
             .ok_or(anyhow!("Could not find default input device"))?
+            .name()?
     };
+
+    let device = devices
+        .iter()
+        .find(|d| d.name().is_ok_and(|n| n == device_name))
+        .take()
+        .ok_or(anyhow!("Could not find requested device"))?;
 
     let quality_value = {
         let quialities: Vec<StreamQuality> = StreamQuality::iter().collect();
@@ -606,6 +612,7 @@ async fn main_wrapper() -> Result<()> {
 
     let configs = device
         .supported_input_configs()?
+        .chain(device.supported_output_configs()?)
         .filter(|c| c.sample_format() == SampleFormat::F32)
         .filter_map(|c| {
             c.try_with_sample_rate(SampleRate(48000))
@@ -625,10 +632,6 @@ async fn main_wrapper() -> Result<()> {
 
     debug!("Sample Format {:?}", config.sample_format());
 
-    let err_fn = move |err| {
-        error!("an error occurred on stream: {}", err);
-    };
-
     let config_clone = config.clone();
     let mut stream_close_rx = close_rx.clone();
     let playback_capturer_task = async move {
@@ -642,7 +645,9 @@ async fn main_wrapper() -> Result<()> {
                     eprintln!("{e:?}");
                 }
             },
-            err_fn,
+            move |err| {
+                error!("En error occurred on stream: {}", err);
+            },
             None,
         )?;
 
