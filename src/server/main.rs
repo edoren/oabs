@@ -62,9 +62,14 @@ struct Opt {
     #[arg(short, long, value_name = "QUALITY", value_enum)]
     quality: Option<StreamQuality>,
 
-    /// Specify the delay between input and output
+    /// The maximum amount of supported clients
     #[arg(short, long, value_name = "MAX_CLIENTS", default_value_t = 5)]
     max_connections: u16,
+
+    /// The device to capture audio from
+    #[cfg(not(target_os = "android"))]
+    #[arg(short, long, value_name = "DEVICE")]
+    device: Option<String>,
 }
 
 async fn send_data(stream: &mut TcpStream, data: &[u8]) -> Result<(), io::Error> {
@@ -507,17 +512,21 @@ async fn main_wrapper() -> Result<()> {
 
     // App
 
-    println!(" ██████╗  █████╗ ██████╗ ███████╗");
-    println!("██╔═══██╗██╔══██╗██╔══██╗██╔════╝");
-    println!("██║   ██║███████║██████╔╝███████╗");
-    println!("██║   ██║██╔══██║██╔══██╗╚════██║");
-    println!("╚██████╔╝██║  ██║██████╔╝███████║");
-    println!(" ╚═════╝ ╚═╝  ╚═╝╚═════╝ ╚══════╝");
-    println!("[ Open Audio Broadcast Software ]");
-    println!();
+    eprintln!(" ██████╗  █████╗ ██████╗ ███████╗");
+    eprintln!("██╔═══██╗██╔══██╗██╔══██╗██╔════╝");
+    eprintln!("██║   ██║███████║██████╔╝███████╗");
+    eprintln!("██║   ██║██╔══██║██╔══██╗╚════██║");
+    eprintln!("╚██████╔╝██║  ██║██████╔╝███████║");
+    eprintln!(" ╚═════╝ ╚═╝  ╚═╝╚═════╝ ╚══════╝");
+    eprintln!("[ Open Audio Broadcast Software ]");
+    eprintln!();
 
     let server_addr = SocketAddr::new(Ipv4Addr::new(0, 0, 0, 0).into(), opt.port);
     let host = cpal::default_host();
+
+    // CLI UI
+
+    let mut additional_space = false;
 
     let device = {
         #[cfg(not(target_os = "android"))]
@@ -530,11 +539,27 @@ async fn main_wrapper() -> Result<()> {
                 .map(|x| x.name().unwrap_or_default())
                 .collect::<Vec<String>>();
 
-            let selection = FuzzySelect::with_theme(&ColorfulTheme::default())
-                .with_prompt("Select the device to capture")
-                .default(0)
-                .items(&devices_names)
-                .interact()?;
+            let selection = if let Some(device_name) = opt.device {
+                let device_found = devices_names.iter().enumerate().find_map(|(i, d)| {
+                    if d == &device_name {
+                        Some(i)
+                    } else {
+                        None
+                    }
+                });
+                if let Some(selected_index) = device_found {
+                    selected_index
+                } else {
+                    return Err(anyhow!("Could not find a device with name {device_name}"));
+                }
+            } else {
+                additional_space = true;
+                FuzzySelect::with_theme(&ColorfulTheme::default())
+                    .with_prompt("Select the device to capture")
+                    .default(0)
+                    .items(&devices_names)
+                    .interact()?
+            };
 
             input_devices[selection].clone()
         }
@@ -558,6 +583,7 @@ async fn main_wrapper() -> Result<()> {
                     .default(quialities.len() / 2)
                     .items(&quialities_names)
                     .interact()?;
+                additional_space = true;
                 quialities[selection].clone()
             }
             #[cfg(target_os = "android")]
@@ -574,8 +600,9 @@ async fn main_wrapper() -> Result<()> {
                 * ((quality as u32) as f32)
     };
 
-    #[cfg(not(target_os = "android"))]
-    println!();
+    if additional_space {
+        eprintln!();
+    }
 
     let configs = device
         .supported_input_configs()?
@@ -612,7 +639,7 @@ async fn main_wrapper() -> Result<()> {
                 samples.extend_from_slice(&data);
                 let res = data_send_tx.send(data.to_vec());
                 if let Err(e) = res {
-                    println!("{e:?}");
+                    eprintln!("{e:?}");
                 }
             },
             err_fn,
