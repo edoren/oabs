@@ -67,7 +67,6 @@ struct Opt {
     max_connections: u16,
 
     /// The device to capture audio from
-    #[cfg(not(target_os = "android"))]
     #[arg(short, long, value_name = "DEVICE")]
     device: Option<String>,
 
