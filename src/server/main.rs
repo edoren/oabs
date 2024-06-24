@@ -476,6 +476,12 @@ async fn stream_server(
 }
 
 async fn main_wrapper() -> Result<()> {
+    
+    #[cfg(target_os = "android")]
+    {
+        return Err(anyhow!("This program is not supported on Android"));
+    }
+
     let opt = Opt::parse();
 
     let app_config_dir = dirs::config_dir()
