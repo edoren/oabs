@@ -166,6 +166,7 @@ async fn client_handler(
                                     pong_deadline = Instant::now() + Duration::from_secs(10);
                                 }
                                 if value == "CLOSE" {
+                                    debug!("Close requested from client with id {client_id:?}");
                                     break;
                                 }
                             }
@@ -354,11 +355,10 @@ async fn stream_server(
                     }
                 }
             }
-            Err(e) => {
-                if e.kind() != ErrorKind::WouldBlock {
-                    error!("{e}");
-                }
-            }
+            Err(e) => match e.kind() {
+                ErrorKind::WouldBlock | ErrorKind::ConnectionReset => {}
+                _ => error!("{:?}: {e}", e.kind()),
+            },
         }
 
         let raw_samples: Vec<f32> = loop {
@@ -476,7 +476,6 @@ async fn stream_server(
 }
 
 async fn main_wrapper() -> Result<()> {
-    
     #[cfg(target_os = "android")]
     {
         return Err(anyhow!("This program is not supported on Android"));
