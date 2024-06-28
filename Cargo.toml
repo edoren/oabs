@@ -21,7 +21,7 @@ path = "src/client/main.rs"
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 cpal = { version = "0.15", features = ["oboe-shared-stdcxx"] }
-dialoguer = { version = "0.11", features = ["fuzzy-select"] }
+dialoguer = { version = "0.11", features = ["fuzzy-select", "history"] }
 dirs = "5.0"
 log = "0.4"
 ringbuf = "0.4"

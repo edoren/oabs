@@ -14,7 +14,10 @@ use cpal::{
 };
 use dialoguer::{theme::ColorfulTheme, FuzzySelect, Input};
 use log::{debug, error, info, trace};
-use oabs_lib::{OABSMessage, SupportedStreamConfigDeserialize};
+use oabs_lib::{
+    history::HistoryFile,
+    serializers::{OABSMessage, SupportedStreamConfigDeserialize},
+};
 use ogg_next_sys::*;
 use ringbuf::{
     traits::{Consumer, Producer, Split},
@@ -33,6 +36,11 @@ use tracing_subscriber::{
 
 const MIN_LATENCY: i64 = 50;
 const MAX_LATENCY: i64 = 500;
+
+const DEFAULT_LATENCY: i64 = 150;
+const DEFAULT_VOLUME: i64 = 100;
+const DEFAULT_SERVER_NAME: &str = "localhost";
+const DEFAULT_PORT: i64 = 48182;
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Client", long_about = None)]
@@ -73,6 +81,30 @@ async fn recv_data(stream: &mut TcpStream) -> Result<Vec<u8>> {
     let mut bytes = vec![0u8; len as usize];
     stream.read_exact(&mut bytes).await?;
     Ok(bytes)
+}
+
+fn parse_server_name(input: &str) -> Option<SocketAddr> {
+    let mut splitted = input.split(":");
+    let host: String = if let Some(val) = splitted.next() {
+        val.to_string()
+    } else {
+        return None;
+    };
+    let port = splitted.next();
+    let address = if port.is_none() {
+        host + ":" + &DEFAULT_PORT.to_string()
+    } else {
+        host
+    };
+    let value = address.to_socket_addrs();
+    if let Ok(mut iter) = value {
+        while let Some(val) = iter.next() {
+            if val.is_ipv4() {
+                return Some(val);
+            }
+        }
+    }
+    None
 }
 
 unsafe fn decode_first_package(
@@ -319,45 +351,56 @@ async fn main_wrapper() -> Result<()> {
 
     // App
 
-    println!(" ██████╗  █████╗ ██████╗ ███████╗");
-    println!("██╔═══██╗██╔══██╗██╔══██╗██╔════╝");
-    println!("██║   ██║███████║██████╔╝███████╗");
-    println!("██║   ██║██╔══██║██╔══██╗╚════██║");
-    println!("╚██████╔╝██║  ██║██████╔╝███████║");
-    println!(" ╚═════╝ ╚═╝  ╚═╝╚═════╝ ╚══════╝");
-    println!("[ Open Audio Broadcast Software ]");
-    println!();
+    eprintln!(" ██████╗  █████╗ ██████╗ ███████╗");
+    eprintln!("██╔═══██╗██╔══██╗██╔══██╗██╔════╝");
+    eprintln!("██║   ██║███████║██████╔╝███████╗");
+    eprintln!("██║   ██║██╔══██║██╔══██╗╚════██║");
+    eprintln!("╚██████╔╝██║  ██║██████╔╝███████║");
+    eprintln!(" ╚═════╝ ╚═╝  ╚═╝╚═════╝ ╚══════╝");
+    eprintln!("[ Open Audio Broadcast Software ]");
+    eprintln!();
 
     let host = cpal::default_host();
 
     let input_theme = ColorfulTheme::default();
 
+    let mut history_file: HistoryFile =
+        HistoryFile::new(&app_config_dir.join("history.json"), Some(10), true)?;
+
     let server_address = if let Some(server) = opt.server {
         server
     } else {
+        let history = history_file.get("server_name");
         Input::with_theme(&input_theme)
             .with_prompt("Enter the server")
-            .default(String::from("localhost:48182"))
+            .default(
+                history
+                    .get_last()
+                    .cloned()
+                    .unwrap_or(String::from(DEFAULT_SERVER_NAME)),
+            )
             .validate_with(|input: &String| -> Result<(), &str> {
-                let value = input.to_socket_addrs();
-                if let Ok(mut iter) = value {
-                    while let Some(val) = iter.next() {
-                        if val.is_ipv4() {
-                            return Ok(());
-                        }
-                    }
+                match parse_server_name(input) {
+                    Some(_) => Ok(()),
+                    None => Err("This is not a valid address"),
                 }
-                Err("This is not a valid address")
             })
-            .interact()?
+            .history_with(history)
+            .interact_text()?
     };
 
     let latency = if let Some(latency) = opt.latency {
         latency
     } else {
+        let history = history_file.get("latency");
         Input::with_theme(&input_theme)
             .with_prompt("Enter the latency")
-            .default(150)
+            .default(
+                history
+                    .get_last()
+                    .cloned()
+                    .map_or(DEFAULT_LATENCY, |s| s.parse().unwrap_or(DEFAULT_LATENCY)),
+            )
             .validate_with(|val: &i64| -> Result<(), &str> {
                 if *val >= MIN_LATENCY && *val <= MAX_LATENCY {
                     Ok(())
@@ -365,23 +408,31 @@ async fn main_wrapper() -> Result<()> {
                     Err("Volume should be between 0 and 100")
                 }
             })
-            .interact()? as u32
+            .history_with(history)
+            .interact_text()? as u32
     };
 
     let volume = if let Some(volume) = opt.volume {
         volume
     } else {
+        let history = history_file.get("volume");
         Input::with_theme(&input_theme)
             .with_prompt("Enter the volume")
-            .default(100)
-            .validate_with(|val: &i32| -> Result<(), &str> {
+            .default(
+                history
+                    .get_last()
+                    .cloned()
+                    .map_or(DEFAULT_VOLUME, |s| s.parse().unwrap_or(DEFAULT_VOLUME)),
+            )
+            .validate_with(|val: &i64| -> Result<(), &str> {
                 if *val >= 0 && *val <= 100 {
                     Ok(())
                 } else {
                     Err("Volume should be between 0 and 100")
                 }
             })
-            .interact()? as u32
+            .history_with(history)
+            .interact_text()? as u32
     };
 
     let device = {
@@ -414,13 +465,11 @@ async fn main_wrapper() -> Result<()> {
             .ok_or(anyhow!("Could not find default output device"))?
     };
 
-    println!();
+    drop(history_file);
+    eprintln!();
 
-    let remote_addr = server_address
-        .to_socket_addrs()?
-        .filter(|s| s.is_ipv4())
-        .next()
-        .ok_or(anyhow!("Could not resolve address"))?;
+    let remote_addr =
+        parse_server_name(&server_address).ok_or(anyhow!("Could not resolve address"))?;
 
     debug!("Connecting to server {}", server_address);
     let mut stream = TcpStream::connect(remote_addr).await?;

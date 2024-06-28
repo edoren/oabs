@@ -19,7 +19,7 @@ use cpal::{
 };
 use dialoguer::{theme::ColorfulTheme, FuzzySelect};
 use log::{debug, error, info, trace};
-use oabs_lib::{OABSMessage, SupportedStreamConfigSerialize};
+use oabs_lib::serializers::{OABSMessage, SupportedStreamConfigSerialize};
 use ogg_next_sys::*;
 use rand::{thread_rng, Rng};
 use strum::{EnumIter, EnumString, IntoEnumIterator, IntoStaticStr};
