@@ -23,19 +23,15 @@ impl MyHistory {
         }
     }
 
-    pub fn get_last(&self) -> Option<&String> {
-        self.history.front()
+    pub fn get_last(&self) -> Option<String> {
+        self.history.front().cloned()
     }
-}
 
-impl<T: ToString> History<T> for MyHistory {
-    fn read(&self, pos: usize) -> Option<String> {
+    pub fn get(&self, pos: usize) -> Option<String> {
         self.history.get(pos).cloned()
     }
 
-    fn write(&mut self, val: &T) {
-        let val = val.to_string();
-
+    pub fn add(&mut self, val: String) {
         if self.no_duplicates {
             self.history.retain(|v| v != &val);
         }
@@ -45,6 +41,17 @@ impl<T: ToString> History<T> for MyHistory {
         if let Some(max_entries) = self.max_entries {
             self.history.truncate(max_entries);
         }
+    }
+}
+
+impl<T: ToString> History<T> for MyHistory {
+    fn read(&self, pos: usize) -> Option<String> {
+        self.get(pos)
+    }
+
+    fn write(&mut self, val: &T) {
+        let val = val.to_string();
+        self.add(val);
     }
 }
 

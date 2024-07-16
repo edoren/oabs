@@ -3,7 +3,7 @@ use std::{
     collections::HashMap,
     io::{self, ErrorKind},
     mem::MaybeUninit,
-    net::{Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     process::ExitCode,
     slice,
     sync::atomic::{AtomicUsize, Ordering},
@@ -18,10 +18,15 @@ use cpal::{
     Device, SampleFormat, SampleRate, SupportedStreamConfig,
 };
 use dialoguer::{theme::ColorfulTheme, FuzzySelect};
+use local_ip_address::local_ip;
 use log::{debug, error, info, trace};
-use oabs_lib::serializers::{OABSMessage, SupportedStreamConfigSerialize};
+use oabs_lib::{
+    history::HistoryFile,
+    serializers::{OABSMessage, SupportedStreamConfigSerialize},
+};
 use ogg_next_sys::*;
 use rand::{thread_rng, Rng};
+use serde::{Deserialize, Serialize};
 use strum::{EnumIter, EnumString, IntoEnumIterator, IntoStaticStr};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -29,15 +34,31 @@ use tokio::{
     signal,
     sync::{mpsc, watch},
     task::{yield_now, JoinSet},
-    time::{sleep_until, timeout_at, Instant},
+    time::{sleep, sleep_until, timeout_at, Instant},
 };
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{
     filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
 };
 
-#[derive(PartialEq, Eq, Hash, ValueEnum, Debug, Clone, EnumIter, EnumString, IntoStaticStr)]
+mod upnp;
+use upnp::{AddPortConfig, DeletePortConfig, PortMappingProtocol, UPnP};
+
+#[derive(
+    PartialEq,
+    Eq,
+    Hash,
+    ValueEnum,
+    Debug,
+    Clone,
+    EnumIter,
+    EnumString,
+    IntoStaticStr,
+    Serialize,
+    Deserialize,
+)]
 #[strum(serialize_all = "title_case")]
+// #[serde(rename_all = "snake_case")]
 enum StreamQuality {
     LOWEST,
     LOW,
@@ -51,11 +72,13 @@ enum ClientStatus {
     Disconnected { id: String },
 }
 
+const DEFAULT_PORT: u16 = 48182;
+
 #[derive(Parser, Debug)]
 #[command(version, about = "Server", long_about = None)]
 struct Opt {
     /// The port name to use
-    #[arg(short, long, value_name = "PORT", default_value_t = 48182)]
+    #[arg(short, long, value_name = "PORT", default_value_t = DEFAULT_PORT)]
     port: u16,
 
     /// Specify the delay between input and output
@@ -475,6 +498,77 @@ async fn stream_server(
     Ok(())
 }
 
+async fn upnp_connector(port: u16, mut close_rx: watch::Receiver<bool>) -> Result<()> {
+    debug!("Starting UPnP task");
+
+    let local_ipv4 = match local_ip() {
+        Ok(IpAddr::V4(ipv4)) => ipv4,
+        Ok(IpAddr::V6(ipv6)) => {
+            debug!("IPv6 {ipv6} not supported for UPnP");
+            return Ok(());
+        }
+        Err(_) => return Ok(()),
+    };
+
+    let add_mapping = AddPortConfig {
+        internal_client: local_ipv4,
+        internal_port: port,
+        external_port: port,
+        protocol: PortMappingProtocol::BOTH,
+        enabled: true,
+        description: "OABS Server".into(),
+        lease_duration: 600,
+    };
+
+    let delete_mapping = DeletePortConfig {
+        external_port: port,
+        protocol: PortMappingProtocol::BOTH,
+    };
+
+    let upnp = match UPnP::new().await {
+        Ok(devices) => devices,
+        Err(_e) => {
+            debug!("Error setting UPnP port");
+            return Ok(());
+        }
+    };
+
+    let _ = upnp.delete_port(&delete_mapping).await;
+    let result = upnp.add_port(&add_mapping).await;
+
+    if result.is_ok() {
+        if let Ok(ip) = upnp.get_external_ip_address().await {
+            info!("Running on external ip {ip}")
+        } else {
+            error!("Could not get external ip");
+        }
+    }
+
+    let mut retry_time: u64 = (add_mapping.lease_duration / 2).into();
+    loop {
+        tokio::select! {
+            _ = close_rx.changed() => {
+                if *close_rx.borrow_and_update() {
+                    break;
+                }
+            },
+            _ = sleep(Duration::from_secs(retry_time)) => { },
+        }
+
+        let result = upnp.add_port(&add_mapping).await;
+        if result.is_ok() {
+            retry_time = (add_mapping.lease_duration / 2).into();
+        } else {
+            retry_time = 5;
+        }
+    }
+
+    let _ = upnp.delete_port(&delete_mapping).await;
+
+    debug!("Stopping UPnP task");
+    Ok::<(), anyhow::Error>(())
+}
+
 async fn main_wrapper() -> Result<()> {
     #[cfg(target_os = "android")]
     {
@@ -523,8 +617,14 @@ async fn main_wrapper() -> Result<()> {
     let server_addr = SocketAddr::new(Ipv4Addr::new(0, 0, 0, 0).into(), opt.port);
 
     let host = cpal::default_host();
-    let devices: Vec<Device> = host.devices()?.filter(|x| x.name().is_ok()).collect();
-    let devices_names = devices
+    let mut devices: Vec<Device> = host.devices()?.filter(|x| x.name().is_ok()).collect();
+    devices.sort_by(|a, b| {
+        a.name()
+            .unwrap_or_default()
+            .to_lowercase()
+            .cmp(&b.name().unwrap_or_default().to_lowercase())
+    });
+    let mut devices_names = devices
         .iter()
         .map(|x| x.name().unwrap_or_default())
         .collect::<Vec<String>>();
@@ -545,8 +645,11 @@ async fn main_wrapper() -> Result<()> {
 
     // CLI UI
 
+    let mut history_file = HistoryFile::new(&app_config_dir.join("history.json"), Some(10), true)?;
+
     let mut additional_space = false;
 
+    let device_history = history_file.get("device");
     let device_name = if let Some(device_name) = opt.device {
         let device_found = devices_names.iter().find(|&d| d == &device_name);
         if let Some(device_name) = device_found {
@@ -557,6 +660,13 @@ async fn main_wrapper() -> Result<()> {
     } else {
         #[cfg(not(target_os = "android"))]
         {
+            if let Some(last_device) = device_history.get_last() {
+                if let Some(index) = devices_names.iter().position(|d| d == &last_device) {
+                    devices.swap(0, index);
+                    devices_names.swap(0, index);
+                }
+            }
+
             additional_space = true;
             let selection = FuzzySelect::with_theme(&ColorfulTheme::default())
                 .with_prompt("Select the device to capture")
@@ -572,6 +682,7 @@ async fn main_wrapper() -> Result<()> {
             .ok_or(anyhow!("Could not find default input device"))?
             .name()?
     };
+    device_history.add(device_name.clone());
 
     let device = devices
         .iter()
@@ -580,36 +691,51 @@ async fn main_wrapper() -> Result<()> {
         .ok_or(anyhow!("Could not find requested device"))?;
 
     let quality_value = {
-        let quialities: Vec<StreamQuality> = StreamQuality::iter().collect();
+        let qualities: Vec<StreamQuality> = StreamQuality::iter().collect();
 
+        let quality_history = history_file.get("quality");
         let quality = if let Some(quality) = opt.quality {
             quality
         } else {
             #[cfg(not(target_os = "android"))]
             {
-                let quialities_names: Vec<&str> = quialities.iter().map(|e| e.into()).collect();
+                let default: usize = if let Some(Ok(last_quality)) = quality_history
+                    .get_last()
+                    .map(|q| q.to_owned().parse::<StreamQuality>())
+                {
+                    qualities
+                        .iter()
+                        .position(|d| d == &last_quality)
+                        .unwrap_or(0)
+                } else {
+                    qualities.len() / 2
+                };
+
+                let qualities_names: Vec<&str> = qualities.iter().map(|e| e.into()).collect();
                 let selection = FuzzySelect::with_theme(&ColorfulTheme::default())
                     .with_prompt("Select the stream quality")
-                    .default(quialities.len() / 2)
-                    .items(&quialities_names)
+                    .default(default)
+                    .items(&qualities_names)
                     .interact()?;
                 additional_space = true;
-                quialities[selection].clone()
+                qualities[selection].clone()
             }
             #[cfg(target_os = "android")]
             {
-                quialities[quialities.len() / 2].clone()
+                qualities[qualities.len() / 2].clone()
             }
         };
+        quality_history.add(Into::<&str>::into(&quality).to_string());
 
         let quality_val_min = -0.1;
         let quality_val_max = 1.0;
 
         quality_val_min
-            + (quality_val_max - quality_val_min) / (quialities.len() - 1) as f32
+            + (quality_val_max - quality_val_min) / (qualities.len() - 1) as f32
                 * ((quality as u32) as f32)
     };
 
+    drop(history_file);
     if additional_space {
         eprintln!();
     }
@@ -646,7 +772,7 @@ async fn main_wrapper() -> Result<()> {
                 samples.extend_from_slice(&data);
                 let res = data_send_tx.send(data.to_vec());
                 if let Err(e) = res {
-                    eprintln!("{e:?}");
+                    error!("{e:?}");
                 }
             },
             move |err| {
@@ -699,26 +825,32 @@ async fn main_wrapper() -> Result<()> {
         return Ok::<(), anyhow::Error>(());
     };
 
+    let stream_server_task = stream_server(
+        server_addr,
+        quality_value,
+        config.clone(),
+        data_send_rx,
+        close_rx.clone(),
+        client_status_rx,
+    );
+
     let payload_joinh = tokio::spawn(payload_server(
         server_addr,
         config.clone(),
         close_rx.clone(),
         client_status_tx,
     ));
+    let upnp_joinh = tokio::spawn(upnp_connector(opt.port, close_rx.clone()));
     let close_joinh = tokio::spawn(close_task);
 
-    let (payload_res, close_res, playback_capturer_res, stream_res) = tokio::join!(
+    drop(close_rx);
+
+    let (payload_res, upnp_res, close_res, playback_capturer_res, stream_res) = tokio::join!(
         payload_joinh,
+        upnp_joinh,
         close_joinh,
         playback_capturer_task,
-        stream_server(
-            server_addr,
-            quality_value,
-            config.clone(),
-            data_send_rx,
-            close_rx,
-            client_status_rx,
-        )
+        stream_server_task
     );
     if let Err(e) = stream_res {
         error!("{e:?}");
@@ -727,6 +859,9 @@ async fn main_wrapper() -> Result<()> {
         error!("{e:?}");
     }
     if let Err(e) = payload_res {
+        error!("{e:?}");
+    }
+    if let Err(e) = upnp_res {
         error!("{e:?}");
     }
     if let Err(e) = close_res {

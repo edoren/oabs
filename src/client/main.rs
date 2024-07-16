@@ -40,7 +40,7 @@ const MAX_LATENCY: i64 = 500;
 const DEFAULT_LATENCY: i64 = 150;
 const DEFAULT_VOLUME: i64 = 100;
 const DEFAULT_SERVER_NAME: &str = "localhost";
-const DEFAULT_PORT: i64 = 48182;
+const DEFAULT_PORT: u16 = 48182;
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Client", long_about = None)]
@@ -364,8 +364,7 @@ async fn main_wrapper() -> Result<()> {
 
     let input_theme = ColorfulTheme::default();
 
-    let mut history_file: HistoryFile =
-        HistoryFile::new(&app_config_dir.join("history.json"), Some(10), true)?;
+    let mut history_file = HistoryFile::new(&app_config_dir.join("history.json"), Some(10), true)?;
 
     let server_address = if let Some(server) = opt.server {
         server
@@ -376,7 +375,6 @@ async fn main_wrapper() -> Result<()> {
             .default(
                 history
                     .get_last()
-                    .cloned()
                     .unwrap_or(String::from(DEFAULT_SERVER_NAME)),
             )
             .validate_with(|input: &String| -> Result<(), &str> {
@@ -398,7 +396,6 @@ async fn main_wrapper() -> Result<()> {
             .default(
                 history
                     .get_last()
-                    .cloned()
                     .map_or(DEFAULT_LATENCY, |s| s.parse().unwrap_or(DEFAULT_LATENCY)),
             )
             .validate_with(|val: &i64| -> Result<(), &str> {
@@ -421,7 +418,6 @@ async fn main_wrapper() -> Result<()> {
             .default(
                 history
                     .get_last()
-                    .cloned()
                     .map_or(DEFAULT_VOLUME, |s| s.parse().unwrap_or(DEFAULT_VOLUME)),
             )
             .validate_with(|val: &i64| -> Result<(), &str> {
