@@ -305,165 +305,12 @@ unsafe fn decode_next_package<P: Producer<Item = f32>>(
     Ok(())
 }
 
-async fn main_wrapper() -> Result<()> {
-    let opt = Opt::parse();
-
-    let app_config_dir = dirs::config_dir()
-        .ok_or(anyhow!("Could not get config dir"))?
-        .join("oabs");
-
-    // Logging
-
-    let logs_dir = app_config_dir.join("logs");
-    let default_filter = |filter: LevelFilter| {
-        EnvFilter::builder()
-            .with_default_directive(filter.into())
-            .from_env_lossy()
-    };
-
-    let file_appender = RollingFileAppender::builder()
-        .max_log_files(7)
-        .rotation(Rotation::DAILY)
-        .filename_prefix("oabs")
-        .filename_suffix("log")
-        .build(logs_dir.clone())?;
-
-    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
-    let file_layer = tracing_subscriber::fmt::layer()
-        .with_writer(non_blocking)
-        .with_ansi(false)
-        .with_filter(default_filter(LevelFilter::DEBUG))
-        .boxed();
-
-    #[cfg(debug_assertions)]
-    let default_stdout_level_filter = LevelFilter::DEBUG;
-    #[cfg(not(debug_assertions))]
-    let default_stdout_level_filter = LevelFilter::INFO;
-
-    let stdout_layer = tracing_subscriber::fmt::layer()
-        .with_filter(default_filter(default_stdout_level_filter))
-        .boxed();
-
-    let mut layers = Vec::new();
-    layers.push(file_layer);
-    layers.push(stdout_layer);
-    tracing_subscriber::registry().with(layers).init();
-
-    // App
-
-    eprintln!(" ██████╗  █████╗ ██████╗ ███████╗");
-    eprintln!("██╔═══██╗██╔══██╗██╔══██╗██╔════╝");
-    eprintln!("██║   ██║███████║██████╔╝███████╗");
-    eprintln!("██║   ██║██╔══██║██╔══██╗╚════██║");
-    eprintln!("╚██████╔╝██║  ██║██████╔╝███████║");
-    eprintln!(" ╚═════╝ ╚═╝  ╚═╝╚═════╝ ╚══════╝");
-    eprintln!("[ Open Audio Broadcast Software ]");
-    eprintln!();
-
-    let host = cpal::default_host();
-
-    let input_theme = ColorfulTheme::default();
-
-    let mut history_file = HistoryFile::new(&app_config_dir.join("history.json"), Some(10), true)?;
-
-    let server_address = if let Some(server) = opt.server {
-        server
-    } else {
-        let history = history_file.get("server_name");
-        Input::with_theme(&input_theme)
-            .with_prompt("Enter the server")
-            .default(
-                history
-                    .get_last()
-                    .unwrap_or(String::from(DEFAULT_SERVER_NAME)),
-            )
-            .validate_with(|input: &String| -> Result<(), &str> {
-                match parse_server_name(input) {
-                    Some(_) => Ok(()),
-                    None => Err("This is not a valid address"),
-                }
-            })
-            .history_with(history)
-            .interact_text()?
-    };
-
-    let latency = if let Some(latency) = opt.latency {
-        latency
-    } else {
-        let history = history_file.get("latency");
-        Input::with_theme(&input_theme)
-            .with_prompt("Enter the latency")
-            .default(
-                history
-                    .get_last()
-                    .map_or(DEFAULT_LATENCY, |s| s.parse().unwrap_or(DEFAULT_LATENCY)),
-            )
-            .validate_with(|val: &i64| -> Result<(), &str> {
-                if *val >= MIN_LATENCY && *val <= MAX_LATENCY {
-                    Ok(())
-                } else {
-                    Err("Volume should be between 0 and 100")
-                }
-            })
-            .history_with(history)
-            .interact_text()? as u32
-    };
-
-    let volume = if let Some(volume) = opt.volume {
-        volume
-    } else {
-        let history = history_file.get("volume");
-        Input::with_theme(&input_theme)
-            .with_prompt("Enter the volume")
-            .default(
-                history
-                    .get_last()
-                    .map_or(DEFAULT_VOLUME, |s| s.parse().unwrap_or(DEFAULT_VOLUME)),
-            )
-            .validate_with(|val: &i64| -> Result<(), &str> {
-                if *val >= 0 && *val <= 100 {
-                    Ok(())
-                } else {
-                    Err("Volume should be between 0 and 100")
-                }
-            })
-            .history_with(history)
-            .interact_text()? as u32
-    };
-
-    let device = {
-        #[cfg(not(target_os = "android"))]
-        if !opt.default_device {
-            let output_devices: Vec<Device> = host
-                .output_devices()?
-                .filter(|x| x.name().is_ok())
-                .collect();
-
-            let devices_names = output_devices
-                .iter()
-                .map(|x| x.name().unwrap_or_default())
-                .collect::<Vec<String>>();
-
-            let selection = FuzzySelect::with_theme(&input_theme)
-                .with_prompt("Select the output device")
-                .default(0)
-                .items(&devices_names)
-                .interact()?;
-
-            output_devices[selection].clone()
-        } else {
-            host.default_output_device()
-                .ok_or(anyhow!("Could not find default output device"))?
-        }
-
-        #[cfg(target_os = "android")]
-        host.default_output_device()
-            .ok_or(anyhow!("Could not find default output device"))?
-    };
-
-    drop(history_file);
-    eprintln!();
-
+async fn controller(
+    server_address: String,
+    latency: u32,
+    volume: u32,
+    device: Device,
+) -> Result<()> {
     let remote_addr =
         parse_server_name(&server_address).ok_or(anyhow!("Could not resolve address"))?;
 
@@ -814,9 +661,173 @@ async fn main_wrapper() -> Result<()> {
     Ok(())
 }
 
+async fn cli() -> Result<()> {
+    let opt = Opt::parse();
+
+    let app_config_dir = dirs::config_dir()
+        .ok_or(anyhow!("Could not get config dir"))?
+        .join("oabs");
+
+    // Logging
+
+    let logs_dir = app_config_dir.join("logs");
+    let default_filter = |filter: LevelFilter| {
+        EnvFilter::builder()
+            .with_default_directive(filter.into())
+            .from_env_lossy()
+    };
+
+    let file_appender = RollingFileAppender::builder()
+        .max_log_files(7)
+        .rotation(Rotation::DAILY)
+        .filename_prefix("oabs")
+        .filename_suffix("log")
+        .build(logs_dir.clone())?;
+
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_writer(non_blocking)
+        .with_ansi(false)
+        .with_filter(default_filter(LevelFilter::DEBUG))
+        .boxed();
+
+    #[cfg(debug_assertions)]
+    let default_stdout_level_filter = LevelFilter::DEBUG;
+    #[cfg(not(debug_assertions))]
+    let default_stdout_level_filter = LevelFilter::INFO;
+
+    let stdout_layer = tracing_subscriber::fmt::layer()
+        .with_filter(default_filter(default_stdout_level_filter))
+        .boxed();
+
+    let mut layers = Vec::new();
+    layers.push(file_layer);
+    layers.push(stdout_layer);
+    tracing_subscriber::registry().with(layers).init();
+
+    // App
+
+    eprintln!(" ██████╗  █████╗ ██████╗ ███████╗");
+    eprintln!("██╔═══██╗██╔══██╗██╔══██╗██╔════╝");
+    eprintln!("██║   ██║███████║██████╔╝███████╗");
+    eprintln!("██║   ██║██╔══██║██╔══██╗╚════██║");
+    eprintln!("╚██████╔╝██║  ██║██████╔╝███████║");
+    eprintln!(" ╚═════╝ ╚═╝  ╚═╝╚═════╝ ╚══════╝");
+    eprintln!("[ Open Audio Broadcast Software ]");
+    eprintln!();
+
+    let host = cpal::default_host();
+
+    let input_theme = ColorfulTheme::default();
+
+    let mut history_file = HistoryFile::new(&app_config_dir.join("history.json"), Some(10), true)?;
+
+    let server_address = if let Some(server) = opt.server {
+        server
+    } else {
+        let history = history_file.get("server_name");
+        Input::with_theme(&input_theme)
+            .with_prompt("Enter the server")
+            .default(
+                history
+                    .get_last()
+                    .unwrap_or(String::from(DEFAULT_SERVER_NAME)),
+            )
+            .validate_with(|input: &String| -> Result<(), &str> {
+                match parse_server_name(input) {
+                    Some(_) => Ok(()),
+                    None => Err("This is not a valid address"),
+                }
+            })
+            .history_with(history)
+            .interact_text()?
+    };
+
+    let latency = if let Some(latency) = opt.latency {
+        latency
+    } else {
+        let history = history_file.get("latency");
+        Input::with_theme(&input_theme)
+            .with_prompt("Enter the latency")
+            .default(
+                history
+                    .get_last()
+                    .map_or(DEFAULT_LATENCY, |s| s.parse().unwrap_or(DEFAULT_LATENCY)),
+            )
+            .validate_with(|val: &i64| -> Result<(), &str> {
+                if *val >= MIN_LATENCY && *val <= MAX_LATENCY {
+                    Ok(())
+                } else {
+                    Err("Volume should be between 0 and 100")
+                }
+            })
+            .history_with(history)
+            .interact_text()? as u32
+    };
+
+    let volume = if let Some(volume) = opt.volume {
+        volume
+    } else {
+        let history = history_file.get("volume");
+        Input::with_theme(&input_theme)
+            .with_prompt("Enter the volume")
+            .default(
+                history
+                    .get_last()
+                    .map_or(DEFAULT_VOLUME, |s| s.parse().unwrap_or(DEFAULT_VOLUME)),
+            )
+            .validate_with(|val: &i64| -> Result<(), &str> {
+                if *val >= 0 && *val <= 100 {
+                    Ok(())
+                } else {
+                    Err("Volume should be between 0 and 100")
+                }
+            })
+            .history_with(history)
+            .interact_text()? as u32
+    };
+
+    let device = {
+        #[cfg(not(target_os = "android"))]
+        if !opt.default_device {
+            let output_devices: Vec<Device> = host
+                .output_devices()?
+                .filter(|x| x.name().is_ok())
+                .collect();
+
+            let devices_names = output_devices
+                .iter()
+                .map(|x| x.name().unwrap_or_default())
+                .collect::<Vec<String>>();
+
+            let selection = FuzzySelect::with_theme(&input_theme)
+                .with_prompt("Select the output device")
+                .default(0)
+                .items(&devices_names)
+                .interact()?;
+
+            output_devices[selection].clone()
+        } else {
+            host.default_output_device()
+                .ok_or(anyhow!("Could not find default output device"))?
+        }
+
+        #[cfg(target_os = "android")]
+        host.default_output_device()
+            .ok_or(anyhow!("Could not find default output device"))?
+    };
+
+    drop(history_file);
+    eprintln!();
+
+    controller(server_address, latency, volume, device).await?;
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
-    let result = main_wrapper().await;
+    let result = cli().await;
     if let Err(err) = &result {
         error!("{err}");
         return ExitCode::FAILURE;
