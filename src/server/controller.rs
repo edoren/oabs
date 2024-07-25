@@ -1,10 +1,8 @@
 use std::{
-    cmp::Eq,
     collections::HashMap,
     io::{self, ErrorKind},
     mem::MaybeUninit,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    process::ExitCode,
     slice,
     sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
@@ -12,22 +10,14 @@ use std::{
 
 use anyhow::{anyhow, Result};
 use aotuv_lancer_vorbis_sys::*;
-use clap::{ArgAction, Parser, ValueEnum};
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     Device, SampleFormat, SampleRate, SupportedStreamConfig,
 };
-use dialoguer::{theme::ColorfulTheme, FuzzySelect};
 use local_ip_address::local_ip;
 use log::{debug, error, info, trace};
-use oabs_lib::{
-    history::HistoryFile,
-    serializers::{OABSMessage, SupportedStreamConfigSerialize},
-};
 use ogg_next_sys::*;
 use rand::{thread_rng, Rng};
-use serde::{Deserialize, Serialize};
-use strum::{EnumIter, EnumString, IntoEnumIterator, IntoStaticStr};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
@@ -36,66 +26,15 @@ use tokio::{
     task::{yield_now, JoinSet},
     time::{sleep, sleep_until, timeout_at, Instant},
 };
-use tracing_appender::rolling::{RollingFileAppender, Rotation};
-use tracing_subscriber::{
-    filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
+
+use crate::{
+    common::serializers::{OABSMessage, SupportedStreamConfigSerialize},
+    server::upnp::{AddPortConfig, DeletePortConfig, PortMappingProtocol, UPnP},
 };
-
-mod upnp;
-use upnp::{AddPortConfig, DeletePortConfig, PortMappingProtocol, UPnP};
-
-#[derive(
-    PartialEq,
-    Eq,
-    Hash,
-    ValueEnum,
-    Debug,
-    Clone,
-    EnumIter,
-    EnumString,
-    IntoStaticStr,
-    Serialize,
-    Deserialize,
-)]
-#[strum(serialize_all = "title_case")]
-// #[serde(rename_all = "snake_case")]
-enum StreamQuality {
-    LOWEST,
-    LOW,
-    MEDIUM,
-    HIGH,
-    HIGHEST,
-}
 
 enum ClientStatus {
     Connected { id: String },
     Disconnected { id: String },
-}
-
-const DEFAULT_PORT: u16 = 48182;
-
-#[derive(Parser, Debug)]
-#[command(version, about = "Server", long_about = None)]
-struct Opt {
-    /// The port name to use
-    #[arg(short, long, value_name = "PORT", default_value_t = DEFAULT_PORT)]
-    port: u16,
-
-    /// Specify the delay between input and output
-    #[arg(short, long, value_name = "QUALITY", value_enum)]
-    quality: Option<StreamQuality>,
-
-    /// The maximum amount of supported clients
-    #[arg(short, long, value_name = "MAX_CLIENTS", default_value_t = 5)]
-    max_connections: u16,
-
-    /// The device to capture audio from
-    #[arg(short, long, value_name = "DEVICE")]
-    device: Option<String>,
-
-    /// The device to capture audio from
-    #[arg(short, long, action = ArgAction::SetTrue)]
-    list_devices: bool,
 }
 
 async fn send_data(stream: &mut TcpStream, data: &[u8]) -> Result<(), io::Error> {
@@ -569,316 +508,179 @@ async fn upnp_connector(port: u16, mut close_rx: watch::Receiver<bool>) -> Resul
     Ok::<(), anyhow::Error>(())
 }
 
-async fn main_wrapper() -> Result<()> {
-    #[cfg(target_os = "android")]
-    {
-        return Err(anyhow!("This program is not supported on Android"));
-    }
-
-    let opt = Opt::parse();
-
-    let app_config_dir = dirs::config_dir()
-        .ok_or(anyhow!("Could not get config dir"))?
-        .join("oabs_server");
-
-    // Logging
-
-    let logs_dir = app_config_dir.join("logs");
-    let default_filter = |filter: LevelFilter| {
-        EnvFilter::builder()
-            .with_default_directive(filter.into())
-            .from_env_lossy()
-    };
-
-    let file_appender = RollingFileAppender::builder()
-        .max_log_files(7)
-        .rotation(Rotation::DAILY)
-        .filename_prefix("oabs_server")
-        .filename_suffix("log")
-        .build(logs_dir.clone())?;
-    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
-    let file_layer = tracing_subscriber::fmt::layer()
-        .with_writer(non_blocking)
-        .with_ansi(false)
-        .with_filter(default_filter(LevelFilter::DEBUG))
-        .boxed();
-
-    let stdout_layer = tracing_subscriber::fmt::layer()
-        .with_filter(default_filter(LevelFilter::DEBUG))
-        .boxed();
-
-    let mut layers = Vec::new();
-    layers.push(file_layer);
-    layers.push(stdout_layer);
-    tracing_subscriber::registry().with(layers).init();
-
-    // App
-
-    let server_addr = SocketAddr::new(Ipv4Addr::new(0, 0, 0, 0).into(), opt.port);
-
-    let host = cpal::default_host();
-    let mut devices: Vec<Device> = host.devices()?.filter(|x| x.name().is_ok()).collect();
-    devices.sort_by(|a, b| {
-        a.name()
-            .unwrap_or_default()
-            .to_lowercase()
-            .cmp(&b.name().unwrap_or_default().to_lowercase())
-    });
-    let mut devices_names = devices
-        .iter()
-        .map(|x| x.name().unwrap_or_default())
-        .collect::<Vec<String>>();
-
-    if opt.list_devices {
-        devices_names.iter().for_each(|dn| println!("{dn}"));
-        return Ok(());
-    }
-
-    eprintln!(" ██████╗  █████╗ ██████╗ ███████╗");
-    eprintln!("██╔═══██╗██╔══██╗██╔══██╗██╔════╝");
-    eprintln!("██║   ██║███████║██████╔╝███████╗");
-    eprintln!("██║   ██║██╔══██║██╔══██╗╚════██║");
-    eprintln!("╚██████╔╝██║  ██║██████╔╝███████║");
-    eprintln!(" ╚═════╝ ╚═╝  ╚═╝╚═════╝ ╚══════╝");
-    eprintln!("[ Open Audio Broadcast Software ]");
-    eprintln!();
-
-    // CLI UI
-
-    let mut history_file = HistoryFile::new(&app_config_dir.join("history.json"), Some(10), true)?;
-
-    let mut additional_space = false;
-
-    let device_history = history_file.get("device");
-    let device_name = if let Some(device_name) = opt.device {
-        let device_found = devices_names.iter().find(|&d| d == &device_name);
-        if let Some(device_name) = device_found {
-            device_name.clone()
-        } else {
-            return Err(anyhow!("Could not find a device with name {device_name}"));
-        }
-    } else {
-        #[cfg(not(target_os = "android"))]
-        {
-            if let Some(last_device) = device_history.get_last() {
-                if let Some(index) = devices_names.iter().position(|d| d == &last_device) {
-                    devices.swap(0, index);
-                    devices_names.swap(0, index);
-                }
-            }
-
-            additional_space = true;
-            let selection = FuzzySelect::with_theme(&ColorfulTheme::default())
-                .with_prompt("Select the device to capture")
-                .default(0)
-                .items(&devices_names)
-                .interact()?;
-
-            devices_names[selection].clone()
-        }
-
-        #[cfg(target_os = "android")]
-        host.default_input_device()
-            .ok_or(anyhow!("Could not find default input device"))?
-            .name()?
-    };
-    device_history.add(device_name.clone());
-
-    let device = devices
-        .iter()
-        .find(|d| d.name().is_ok_and(|n| n == device_name))
-        .take()
-        .ok_or(anyhow!("Could not find requested device"))?;
-
-    let quality_value = {
-        let qualities: Vec<StreamQuality> = StreamQuality::iter().collect();
-
-        let quality_history = history_file.get("quality");
-        let quality = if let Some(quality) = opt.quality {
-            quality
-        } else {
-            #[cfg(not(target_os = "android"))]
-            {
-                let default: usize = if let Some(Ok(last_quality)) = quality_history
-                    .get_last()
-                    .map(|q| q.to_owned().parse::<StreamQuality>())
-                {
-                    qualities
-                        .iter()
-                        .position(|d| d == &last_quality)
-                        .unwrap_or(0)
-                } else {
-                    qualities.len() / 2
-                };
-
-                let qualities_names: Vec<&str> = qualities.iter().map(|e| e.into()).collect();
-                let selection = FuzzySelect::with_theme(&ColorfulTheme::default())
-                    .with_prompt("Select the stream quality")
-                    .default(default)
-                    .items(&qualities_names)
-                    .interact()?;
-                additional_space = true;
-                qualities[selection].clone()
-            }
-            #[cfg(target_os = "android")]
-            {
-                qualities[qualities.len() / 2].clone()
-            }
-        };
-        quality_history.add(Into::<&str>::into(&quality).to_string());
-
-        let quality_val_min = -0.1;
-        let quality_val_max = 1.0;
-
-        quality_val_min
-            + (quality_val_max - quality_val_min) / (qualities.len() - 1) as f32
-                * ((quality as u32) as f32)
-    };
-
-    drop(history_file);
-    if additional_space {
-        eprintln!();
-    }
-
-    let configs = device
-        .supported_input_configs()?
-        .chain(device.supported_output_configs()?)
-        .filter(|c| c.sample_format() == SampleFormat::F32)
-        .filter_map(|c| {
-            c.try_with_sample_rate(SampleRate(48000))
-                .or(c.try_with_sample_rate(c.min_sample_rate()))
-        })
-        .collect::<Vec<SupportedStreamConfig>>();
-
-    let config = configs
-        .first()
-        .ok_or(anyhow!("Could not find a valid configuration"))?;
-
-    // Run the input stream on a separate thread.
-
-    let (close_tx, close_rx) = watch::channel(false);
-    let (data_send_tx, data_send_rx) = mpsc::unbounded_channel::<Vec<_>>();
-    let (client_status_tx, client_status_rx) = mpsc::channel::<ClientStatus>(100);
-
-    debug!("Sample Format {:?}", config.sample_format());
-
-    let config_clone = config.clone();
-    let mut stream_close_rx = close_rx.clone();
-    let playback_capturer_task = async move {
-        let stream = device.build_input_stream(
-            &config_clone.into(),
-            move |data: &[f32], _| {
-                let mut samples = Vec::new();
-                samples.extend_from_slice(&data);
-                let res = data_send_tx.send(data.to_vec());
-                if let Err(e) = res {
-                    error!("{e:?}");
-                }
-            },
-            move |err| {
-                error!("En error occurred on stream: {}", err);
-            },
-            None,
-        )?;
-
-        info!("Begin recording");
-        stream.play()?;
-        loop {
-            if let Ok(_) = stream_close_rx.changed().await {
-                if *stream_close_rx.borrow_and_update() {
-                    break;
-                }
-            }
-        }
-        stream.pause()?;
-        info!("Stopped recording");
-
-        drop(stream);
-
-        Ok::<(), anyhow::Error>(())
-    };
-
-    #[cfg(not(target_os = "windows"))]
-    let close_task = async move {
-        signal::ctrl_c().await?;
-        close_tx.send(true)?;
-        close_tx.closed().await;
-        return Ok::<(), anyhow::Error>(());
-    };
-
-    #[cfg(target_os = "windows")]
-    let close_task = async move {
-        let mut ctrl_c_signal = signal::windows::ctrl_c()?;
-        let mut ctrl_close_signal = signal::windows::ctrl_close()?;
-        let mut ctrl_break_signal = signal::windows::ctrl_break()?;
-        let mut ctrl_logoff_signal = signal::windows::ctrl_logoff()?;
-        let mut ctrl_shutdown_signal = signal::windows::ctrl_shutdown()?;
-        tokio::select! {
-            _ = ctrl_c_signal.recv() => { },
-            _ = ctrl_close_signal.recv() => { },
-            _ = ctrl_break_signal.recv() => { },
-            _ = ctrl_logoff_signal.recv() => { },
-            _ = ctrl_shutdown_signal.recv() => { },
-        }
-        close_tx.send(true)?;
-        close_tx.closed().await;
-        return Ok::<(), anyhow::Error>(());
-    };
-
-    let stream_server_task = stream_server(
-        server_addr,
-        quality_value,
-        config.clone(),
-        data_send_rx,
-        close_rx.clone(),
-        client_status_rx,
-    );
-
-    let payload_joinh = tokio::spawn(payload_server(
-        server_addr,
-        config.clone(),
-        close_rx.clone(),
-        client_status_tx,
-    ));
-    let upnp_joinh = tokio::spawn(upnp_connector(opt.port, close_rx.clone()));
-    let close_joinh = tokio::spawn(close_task);
-
-    drop(close_rx);
-
-    let (payload_res, upnp_res, close_res, playback_capturer_res, stream_res) = tokio::join!(
-        payload_joinh,
-        upnp_joinh,
-        close_joinh,
-        playback_capturer_task,
-        stream_server_task
-    );
-    if let Err(e) = stream_res {
-        error!("{e:?}");
-    }
-    if let Err(e) = playback_capturer_res {
-        error!("{e:?}");
-    }
-    if let Err(e) = payload_res {
-        error!("{e:?}");
-    }
-    if let Err(e) = upnp_res {
-        error!("{e:?}");
-    }
-    if let Err(e) = close_res {
-        error!("{e:?}");
-    }
-
-    debug!("Server closed successfully");
-
-    Ok(())
+pub struct ServerController {
+    selected_device: Option<Device>,
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    let result = main_wrapper().await;
-    if let Err(err) = &result {
-        error!("{err}");
-        return ExitCode::FAILURE;
+impl ServerController {
+    pub fn new() -> Self {
+        Self {
+            selected_device: cpal::default_host().default_input_device(),
+        }
     }
-    return ExitCode::SUCCESS;
+
+    pub fn get_devices(&self) -> Vec<Device> {
+        let host = cpal::default_host();
+        if let Ok(device) = host.input_devices() {
+            device.filter(|x| x.name().is_ok()).collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub fn get_device_names(&self) -> Vec<String> {
+        let output_devices = self.get_devices();
+        output_devices
+            .iter()
+            .map(|x| x.name().unwrap_or_default())
+            .collect()
+    }
+
+    pub fn set_device(&mut self, device_name: String) {
+        self.selected_device = self
+            .get_devices()
+            .into_iter()
+            .find(|d| d.name().is_ok_and(|d_name| d_name == device_name));
+    }
+
+    pub async fn start(&self, port: u16, quality: f32) -> Result<()> {
+        let device = self
+            .selected_device
+            .as_ref()
+            .ok_or(anyhow!("Could not find default input device"))?;
+
+        let server_addr = SocketAddr::new(Ipv4Addr::new(0, 0, 0, 0).into(), port);
+
+        let configs = device
+            .supported_input_configs()?
+            .chain(device.supported_output_configs()?)
+            .filter(|c| c.sample_format() == SampleFormat::F32)
+            .filter_map(|c| {
+                c.try_with_sample_rate(SampleRate(48000))
+                    .or(c.try_with_sample_rate(c.min_sample_rate()))
+            })
+            .collect::<Vec<SupportedStreamConfig>>();
+
+        let config = configs
+            .first()
+            .ok_or(anyhow!("Could not find a valid configuration"))?;
+
+        // Run the input stream on a separate thread.
+
+        let (close_tx, close_rx) = watch::channel(false);
+        let (data_send_tx, data_send_rx) = mpsc::unbounded_channel::<Vec<_>>();
+        let (client_status_tx, client_status_rx) = mpsc::channel::<ClientStatus>(100);
+
+        debug!("Sample Format {:?}", config.sample_format());
+
+        let config_clone = config.clone();
+        let mut stream_close_rx = close_rx.clone();
+        let playback_capturer_task = async move {
+            let stream = device.build_input_stream(
+                &config_clone.into(),
+                move |data: &[f32], _| {
+                    let mut samples = Vec::new();
+                    samples.extend_from_slice(&data);
+                    let res = data_send_tx.send(data.to_vec());
+                    if let Err(e) = res {
+                        error!("{e:?}");
+                    }
+                },
+                move |err| {
+                    error!("En error occurred on stream: {}", err);
+                },
+                None,
+            )?;
+
+            info!("Begin recording");
+            stream.play()?;
+            loop {
+                if let Ok(_) = stream_close_rx.changed().await {
+                    if *stream_close_rx.borrow_and_update() {
+                        break;
+                    }
+                }
+            }
+            stream.pause()?;
+            info!("Stopped recording");
+
+            drop(stream);
+
+            Ok::<(), anyhow::Error>(())
+        };
+
+        #[cfg(not(target_os = "windows"))]
+        let close_task = async move {
+            signal::ctrl_c().await?;
+            close_tx.send(true)?;
+            close_tx.closed().await;
+            return Ok::<(), anyhow::Error>(());
+        };
+
+        #[cfg(target_os = "windows")]
+        let close_task = async move {
+            let mut ctrl_c_signal = signal::windows::ctrl_c()?;
+            let mut ctrl_close_signal = signal::windows::ctrl_close()?;
+            let mut ctrl_break_signal = signal::windows::ctrl_break()?;
+            let mut ctrl_logoff_signal = signal::windows::ctrl_logoff()?;
+            let mut ctrl_shutdown_signal = signal::windows::ctrl_shutdown()?;
+            tokio::select! {
+                _ = ctrl_c_signal.recv() => { },
+                _ = ctrl_close_signal.recv() => { },
+                _ = ctrl_break_signal.recv() => { },
+                _ = ctrl_logoff_signal.recv() => { },
+                _ = ctrl_shutdown_signal.recv() => { },
+            }
+            close_tx.send(true)?;
+            close_tx.closed().await;
+            return Ok::<(), anyhow::Error>(());
+        };
+
+        let stream_server_task = stream_server(
+            server_addr,
+            quality,
+            config.clone(),
+            data_send_rx,
+            close_rx.clone(),
+            client_status_rx,
+        );
+
+        let payload_joinh = tokio::spawn(payload_server(
+            server_addr,
+            config.clone(),
+            close_rx.clone(),
+            client_status_tx,
+        ));
+        let upnp_joinh = tokio::spawn(upnp_connector(server_addr.port(), close_rx.clone()));
+        let close_joinh = tokio::spawn(close_task);
+
+        drop(close_rx);
+
+        let (payload_res, upnp_res, close_res, playback_capturer_res, stream_res) = tokio::join!(
+            payload_joinh,
+            upnp_joinh,
+            close_joinh,
+            playback_capturer_task,
+            stream_server_task
+        );
+        if let Err(e) = stream_res {
+            error!("{e:?}");
+        }
+        if let Err(e) = playback_capturer_res {
+            error!("{e:?}");
+        }
+        if let Err(e) = payload_res {
+            error!("{e:?}");
+        }
+        if let Err(e) = upnp_res {
+            error!("{e:?}");
+        }
+        if let Err(e) = close_res {
+            error!("{e:?}");
+        }
+
+        debug!("Server closed successfully");
+
+        Ok(())
+    }
 }

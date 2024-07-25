@@ -1,0 +1,30 @@
+[package]
+name = "oabs_cli"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "oabs_cli"
+path = "src/common/lib.rs"
+
+[[bin]]
+name = "oabs_server"
+path = "src/server/main.rs"
+
+[[bin]]
+name = "oabs_client"
+path = "src/client/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+dirs = "5.0"
+clap = { version = "4.5", features = ["derive"] }
+dialoguer = { version = "0.11", features = ["fuzzy-select", "history"] }
+log = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.37", features = ["full"] }
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+strum = { version = "0.26", features = ["derive"] }
+oabs_lib = { path = ".." }
