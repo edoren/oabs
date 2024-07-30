@@ -258,12 +258,6 @@ pub struct ClientController {
     server_receiver_joinh: Option<tokio::task::JoinHandle<Result<()>>>,
 }
 
-// impl Default for ClientController {
-//     fn default() -> Self {
-//         Self::new()
-//     }
-// }
-
 impl ClientController {
     pub fn new() -> Self {
         Self {
@@ -711,5 +705,9 @@ impl ClientController {
         }
         info!("Client closed successfully");
         Ok(())
+    }
+
+    pub fn is_running(&self) -> bool {
+        return self.cancellation_token.is_some();
     }
 }

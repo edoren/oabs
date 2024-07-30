@@ -7,12 +7,14 @@ use std::{
 };
 
 use anyhow::{anyhow, Result};
+use log::error;
 use oabs_lib::{
     client::ClientController,
     common::constants::{DEFAULT_LATENCY, DEFAULT_PORT, DEFAULT_VOLUME},
 };
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, State};
+use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 use tokio::sync::Mutex;
 mod history;
 use history::HistoryFile;
@@ -135,6 +137,14 @@ async fn set_volume(data: State<'_, ClientData>, volume: u32) -> Result<(), Stri
 }
 
 #[tauri::command]
+async fn is_running(data: State<'_, ClientData>) -> Result<bool, String> {
+    if let Some(controller) = &data.lock().await.instance {
+        return Ok(controller.is_running());
+    }
+    Ok(false)
+}
+
+#[tauri::command]
 fn get_devices() -> Vec<String> {
     ClientController::get_device_names()
 }
@@ -162,6 +172,28 @@ async fn get_history() -> Result<HistoryData, String> {
             .and_then(|val| val.parse().ok())
             .unwrap_or(DEFAULT_VOLUME as u32),
     })
+}
+
+#[tauri::command]
+fn show_dialog(
+    app_handle: tauri::AppHandle,
+    window: tauri::Window,
+    message: String,
+    kind: Option<&str>,
+) -> Result<(), String> {
+    let dialog_kind = match kind {
+        Some("info") => MessageDialogKind::Info,
+        Some("warning") => MessageDialogKind::Warning,
+        Some("error") => MessageDialogKind::Error,
+        _ => MessageDialogKind::Info,
+    };
+    app_handle
+        .dialog()
+        .message(message)
+        .kind(dialog_kind)
+        .parent(&window)
+        .show(|_e| {});
+    Ok(())
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -223,17 +255,22 @@ pub fn run() -> Result<()> {
             stop_server,
             get_devices,
             get_history,
-            set_volume
+            set_volume,
+            is_running,
+            show_dialog
         ])
         .plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
             println!("{}, {argv:?}, {cwd}", app.package_info().name);
             app.emit("single-instance", Payload { args: argv, cwd })
                 .unwrap();
         }))
+        .plugin(tauri_plugin_dialog::init())
         .on_window_event(move |_window, event| match event {
             tauri::WindowEvent::CloseRequested { .. } => {
                 if let Some(mut controller) = client_data.blocking_lock().instance.take() {
-                    let value = tauri::async_runtime::block_on(controller.stop());
+                    if let Err(err) = tauri::async_runtime::block_on(controller.stop()) {
+                        error!("{err}");
+                    }
                 }
             }
             _ => {}
