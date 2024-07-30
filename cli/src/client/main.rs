@@ -12,6 +12,7 @@ use oabs_lib::{
     client::ClientController,
     common::constants::{DEFAULT_PORT, DEFAULT_SERVER_NAME, MAX_LATENCY, MIN_LATENCY},
 };
+use tokio::signal;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{
     filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
@@ -195,7 +196,7 @@ async fn cli() -> Result<()> {
     let device_name = {
         #[cfg(not(target_os = "android"))]
         if !opt.default_device {
-            let devices_names = controller.get_device_names();
+            let devices_names = ClientController::get_device_names();
 
             let selection = FuzzySelect::with_theme(&input_theme)
                 .with_prompt("Select the output device")
@@ -218,10 +219,35 @@ async fn cli() -> Result<()> {
     controller.set_latency(latency);
     controller.set_volume(volume);
     if let Some(device_name) = device_name {
-        controller.set_device(device_name);
+        controller.set_device_name(device_name);
     }
 
     controller.start(server_address).await?;
+
+    #[cfg(not(target_os = "windows"))]
+    tokio::select! {
+        _ = signal::ctrl_c() => { },
+        _ = controller.wait() => { },
+    };
+
+    #[cfg(target_os = "windows")]
+    {
+        let mut ctrl_c_signal = signal::windows::ctrl_c()?;
+        let mut ctrl_close_signal = signal::windows::ctrl_close()?;
+        let mut ctrl_break_signal = signal::windows::ctrl_break()?;
+        let mut ctrl_logoff_signal = signal::windows::ctrl_logoff()?;
+        let mut ctrl_shutdown_signal = signal::windows::ctrl_shutdown()?;
+        tokio::select! {
+            _ = ctrl_c_signal.recv() => { },
+            _ = ctrl_close_signal.recv() => { },
+            _ = ctrl_break_signal.recv() => { },
+            _ = ctrl_logoff_signal.recv() => { },
+            _ = ctrl_shutdown_signal.recv() => { },
+            _ = controller.wait() => { },
+        }
+    };
+
+    controller.stop().await?;
 
     Ok(())
 }

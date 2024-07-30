@@ -4,7 +4,7 @@ use anyhow::{anyhow, Result};
 use aotuv_lancer_vorbis_sys::*;
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
-    Device,
+    Device, SupportedStreamConfig,
 };
 use log::{debug, error, info, trace};
 use ogg_next_sys::*;
@@ -15,15 +15,19 @@ use ringbuf::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpStream, UdpSocket},
-    signal,
-    sync::watch,
+    sync::{
+        self,
+        mpsc::{self},
+    },
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::common::{
     constants::{DEFAULT_LATENCY, DEFAULT_VOLUME},
     serializers::{OABSMessage, SupportedStreamConfigDeserialize},
 };
 
+#[derive(Clone)]
 enum StreamStatus {
     Starting,
     Streaming,
@@ -243,28 +247,46 @@ unsafe fn decode_next_package<P: Producer<Item = f32>>(
 
 pub struct ClientController {
     selected_device: Option<Device>,
-    latency: u32,
-    volume: u32,
+    latency: (sync::watch::Sender<u32>, sync::watch::Receiver<u32>),
+    volume: (sync::watch::Sender<u32>, sync::watch::Receiver<u32>),
+
+    cancellation_token: Option<CancellationToken>,
+
+    decode_joinh: Option<std::thread::JoinHandle<Result<()>>>,
+    player_joinh: Option<std::thread::JoinHandle<Result<()>>>,
+    stream_receiver_joinh: Option<tokio::task::JoinHandle<Result<()>>>,
+    server_receiver_joinh: Option<tokio::task::JoinHandle<Result<()>>>,
 }
+
+// impl Default for ClientController {
+//     fn default() -> Self {
+//         Self::new()
+//     }
+// }
 
 impl ClientController {
     pub fn new() -> Self {
         Self {
             selected_device: cpal::default_host().default_output_device(),
-            latency: DEFAULT_LATENCY as u32,
-            volume: DEFAULT_VOLUME as u32,
+            latency: sync::watch::channel(DEFAULT_LATENCY as u32),
+            volume: sync::watch::channel(DEFAULT_VOLUME as u32),
+            cancellation_token: None,
+            decode_joinh: None,
+            player_joinh: None,
+            stream_receiver_joinh: None,
+            server_receiver_joinh: None,
         }
     }
 
     pub fn get_latency(&self) -> u32 {
-        self.volume
+        *self.volume.1.borrow()
     }
 
     pub fn get_volume(&self) -> u32 {
-        self.latency
+        *self.latency.1.borrow()
     }
 
-    pub fn get_devices(&self) -> Vec<Device> {
+    pub fn get_devices() -> Vec<Device> {
         let host = cpal::default_host();
         if let Ok(device) = host.output_devices() {
             device.filter(|x| x.name().is_ok()).collect()
@@ -273,113 +295,35 @@ impl ClientController {
         }
     }
 
-    pub fn get_device_names(&self) -> Vec<String> {
-        let output_devices = self.get_devices();
+    pub fn get_device_names() -> Vec<String> {
+        let output_devices = Self::get_devices();
         output_devices
             .iter()
             .map(|x| x.name().unwrap_or_default())
             .collect()
     }
 
-    pub fn set_device(&mut self, device_name: String) {
-        self.selected_device = self
-            .get_devices()
+    pub fn set_device_name(&mut self, device_name: String) {
+        self.selected_device = Self::get_devices()
             .into_iter()
             .find(|d| d.name().is_ok_and(|d_name| d_name == device_name));
     }
 
-    pub fn set_volume(&mut self, volume: u32) {
-        self.volume = volume;
+    pub fn set_volume(&self, volume: u32) {
+        self.volume.0.send_replace(volume);
     }
 
-    pub fn set_latency(&mut self, latency: u32) {
-        self.latency = latency;
+    pub fn set_latency(&self, latency: u32) {
+        self.latency.0.send_replace(latency);
     }
 
-    pub async fn start(&self, server_address: SocketAddr) -> Result<()> {
-        let device = self
-            .selected_device
-            .as_ref()
-            .ok_or(anyhow!("Could not find default output device"))?;
-
-        debug!("Connecting to server {}", server_address);
-        let mut stream = TcpStream::connect(server_address).await?;
-
-        info!("Connected to server {}", server_address);
-
-        // Wait for the socket to be readable
-        stream.readable().await?;
-
-        // Creating the buffer **after** the `await` prevents it from
-        // being stored in the async task.
-        let client_id: String = loop {
-            match recv_data(&mut stream).await {
-                Ok(data) => {
-                    let value: OABSMessage = serde_json::from_slice(&data)?;
-                    if let OABSMessage::ClientId { id } = value {
-                        break id;
-                    }
-                    return Err(anyhow!("Client id not found"));
-                }
-                Err(e) => {
-                    return Err(e.into());
-                }
-            }
-        };
-        debug!("Receiving client_id {:?}", client_id);
-
-        // Try to read data, this may still fail with `WouldBlock`
-        // if the readiness event is a false positive.
-        let config = loop {
-            match recv_data(&mut stream).await {
-                Ok(data) => {
-                    break serde_json::from_slice(&data)
-                        .map(|SupportedStreamConfigDeserialize(dur)| dur)?;
-                }
-                Err(e) => {
-                    return Err(e.into());
-                }
-            }
-        };
-
-        debug!("Receiving config {:?}", config);
-
-        // Create a delay in case the input and output devices aren't synced.
-        let latency_frames = (self.latency as f32 / 1_000.0) * config.sample_rate().0 as f32;
-        let latency_samples = latency_frames as usize * config.channels() as usize;
-
-        // The buffer to share samples
-        let ring = HeapRb::<f32>::new(latency_samples);
-        let (mut producer, mut consumer) = ring.split();
-
-        debug!("Latency Samples: {latency_samples}");
-
-        // Fill the samples with 0.0 equal to the length of the delay.
-        for _ in 0..latency_samples {
-            // The ring buffer has twice as much space as necessary to add latency here,
-            // so this should never fail
-            producer
-                .try_push(0.0)
-                .map_err(|e| anyhow!("Could not fill buffer: {e}"))?;
-        }
-
-        let (close_tx, close_rx) = watch::channel(false);
-
-        let err_fn = move |err| {
-            error!("an error occurred on stream: {}", err);
-        };
-
-        let mut close_rx_stream_receiver_task = close_rx.clone();
-        let stream_receiver_task = async move {
-            debug!("Starting stream receiver task");
-
-            let local_addr: SocketAddr = "0.0.0.0:12312".parse()?;
-            let cli = UdpSocket::bind(local_addr).await?;
-            cli.connect(server_address).await?;
-
-            debug!("Using local address: {}", cli.local_addr()?);
-
-            let mut buf = [0; 10240];
+    fn create_decode_task(
+        &self,
+        mut encoded_rx: mpsc::Receiver<(StreamStatus, Vec<u8>)>,
+        mut producer: <HeapRb<f32> as ringbuf::traits::Split>::Prod,
+    ) -> std::thread::JoinHandle<Result<()>> {
+        std::thread::spawn(move || {
+            debug!("Starting decode task");
 
             let mut oy: Box<MaybeUninit<ogg_sync_state>> = Box::new(MaybeUninit::uninit());
             let mut os: Box<MaybeUninit<ogg_stream_state>> = Box::new(MaybeUninit::uninit());
@@ -397,57 +341,22 @@ impl ClientController {
                 ogg_sync_init(oy.as_mut_ptr());
             };
 
-            let mut stream_status = StreamStatus::Starting;
-            loop {
-                match stream_status {
-                    StreamStatus::Starting => {
-                        cli.send("START".as_bytes()).await?;
-                    }
-                    StreamStatus::Streaming => {}
-                    StreamStatus::Stopped => {
-                        break;
-                    }
+            'decode_loop: loop {
+                let (stream_status, data) = match encoded_rx.blocking_recv() {
+                    Some(val) => val,
+                    None => continue,
                 };
 
-                let recv_len = tokio::select! {
-                    result = cli.recv(&mut buf) => {
-                        match result {
-                            Ok(len) => len,
-                            Err(e) => {
-                                error!("{e:?}");
-                                continue;
-                            },
-                        }
+                match stream_status {
+                    StreamStatus::Starting => unsafe {
+                        let _ = decode_first_package(
+                            &data, &mut oy, &mut os, &mut og, &mut op, &mut vi, &mut vc, &mut vd,
+                            &mut vb,
+                        );
                     },
-                    result = close_rx_stream_receiver_task.changed() => {
-                        if result.is_ok() && *close_rx_stream_receiver_task.borrow_and_update() {
-                            stream_status = StreamStatus::Stopped;
-                        }
-                        continue;
-                    }
-                };
-
-                match stream_status {
-                    StreamStatus::Starting => {
-                        unsafe {
-                            decode_first_package(
-                                &buf[..recv_len],
-                                &mut oy,
-                                &mut os,
-                                &mut og,
-                                &mut op,
-                                &mut vi,
-                                &mut vc,
-                                &mut vd,
-                                &mut vb,
-                            )?;
-                        }
-                        let _ = cli.send(format!("HEADER_OK {client_id}").as_bytes()).await;
-                        stream_status = StreamStatus::Streaming;
-                    }
                     StreamStatus::Streaming => unsafe {
-                        decode_next_package(
-                            &buf[..recv_len],
+                        let _ = decode_next_package(
+                            &data,
                             &mut oy,
                             &mut os,
                             &mut og,
@@ -456,10 +365,10 @@ impl ClientController {
                             &mut vd,
                             &mut vb,
                             &mut producer,
-                        )?;
+                        );
                     },
                     StreamStatus::Stopped => {
-                        break;
+                        break 'decode_loop;
                     }
                 };
             }
@@ -475,24 +384,181 @@ impl ClientController {
                 ogg_sync_clear(oy.as_mut_ptr());
             }
 
-            debug!("Closing stream receiver task");
-            Ok::<(), anyhow::Error>(())
-        };
+            debug!("Stopping decode task");
+            Ok(())
+        })
+    }
 
-        let config_clone = config.clone();
-        let device_clone = device.clone();
-        let mut player_close_rx = close_rx.clone();
-        let volume = self.volume;
-        let player_task = move || {
-            debug!("Starting player task");
+    async fn stream_receiver_task(
+        client_id: String,
+        server_address: SocketAddr,
+        encoded_tx: mpsc::Sender<(StreamStatus, Vec<u8>)>,
+        child_token: CancellationToken,
+    ) -> Result<()> {
+        debug!("Starting stream receiver task");
 
-            let playback_stream = device_clone.build_output_stream(
-                &config_clone.into(),
+        let local_addr: SocketAddr = "0.0.0.0:12312".parse()?;
+        let cli = UdpSocket::bind(local_addr).await?;
+        cli.connect(server_address).await?;
+
+        debug!("Using local address: {}", cli.local_addr()?);
+
+        let mut buf = [0; 10240];
+
+        let mut stream_status = StreamStatus::Starting;
+        loop {
+            match stream_status {
+                StreamStatus::Starting => {
+                    cli.send("START".as_bytes()).await?;
+                }
+                _ => {}
+            };
+
+            let recv_len = tokio::select! {
+                result = cli.recv(&mut buf) => {
+                    match result {
+                        Ok(len) => len,
+                        Err(e) => {
+                            error!("{e:?}");
+                            continue;
+                        },
+                    }
+                },
+                _ = child_token.cancelled() => {
+                    stream_status = StreamStatus::Stopped;
+                    0
+                }
+            };
+
+            let data = if recv_len > 0 {
+                buf[..recv_len].to_owned()
+            } else {
+                Vec::new()
+            };
+
+            let _ = encoded_tx.send((stream_status.clone(), data)).await;
+
+            match stream_status {
+                StreamStatus::Starting => {
+                    let _ = cli.send(format!("HEADER_OK {client_id}").as_bytes()).await;
+                    stream_status = StreamStatus::Streaming;
+                }
+                StreamStatus::Streaming => {}
+                StreamStatus::Stopped => {
+                    break;
+                }
+            };
+        }
+
+        debug!("Stopping stream receiver task");
+        Ok::<(), anyhow::Error>(())
+    }
+
+    fn create_stream_receiver_task(
+        client_id: String,
+        server_address: SocketAddr,
+        encoded_tx: mpsc::Sender<(StreamStatus, Vec<u8>)>,
+        child_token: CancellationToken,
+    ) -> tokio::task::JoinHandle<Result<()>> {
+        tokio::spawn(async move {
+            Self::stream_receiver_task(client_id, server_address, encoded_tx, child_token).await
+        })
+    }
+
+    async fn server_receiver_task(
+        mut tcp_stream: TcpStream,
+        cancellation_token: CancellationToken,
+    ) -> Result<()> {
+        debug!("Starting server connection task");
+
+        let mut close_requested = false;
+
+        let child_token = cancellation_token.child_token();
+        loop {
+            let data = tokio::select! {
+                result = recv_data(&mut tcp_stream) => {
+                    match result {
+                        Ok(data) => data,
+                        Err(e) => {
+                            error!("{e:?}");
+                            continue;
+                        },
+                    }
+                },
+                _ = child_token.cancelled() => {
+                    close_requested = true;
+                    vec![]
+                }
+            };
+
+            if close_requested {
+                if let Err(e) = send_data(&mut tcp_stream, "CLOSE".as_bytes()).await {
+                    error!("Failed to send CLOSE: {e:?}");
+                }
+                break;
+            }
+
+            let value = match std::str::from_utf8(&data) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            if value == "PING" {
+                trace!("PING");
+                loop {
+                    if let Err(e) = send_data(&mut tcp_stream, "PONG".as_bytes()).await {
+                        debug!("Error Sending Pong: {e:?}");
+                    } else {
+                        trace!("PONG");
+                        break;
+                    }
+                }
+            }
+            if value == "CLOSE" {
+                debug!("Server requested close");
+                break;
+            }
+        }
+
+        cancellation_token.cancel();
+
+        debug!("Stopping server connection task");
+
+        Ok(())
+    }
+
+    fn create_server_receiver_task(
+        tcp_stream: TcpStream,
+        cancellation_token: CancellationToken,
+    ) -> tokio::task::JoinHandle<Result<()>> {
+        tokio::spawn(
+            async move { Self::server_receiver_task(tcp_stream, cancellation_token).await },
+        )
+    }
+
+    fn create_playback_task(
+        &self,
+        config: SupportedStreamConfig,
+        device: Device,
+        mut consumer: <HeapRb<f32> as ringbuf::traits::Split>::Cons,
+        child_token: CancellationToken,
+    ) -> std::thread::JoinHandle<Result<()>> {
+        let volume = self.volume.1.clone();
+
+        std::thread::spawn(move || {
+            debug!("Starting playback task");
+
+            let err_fn = move |err| {
+                error!("An error occurred on stream: {}", err);
+            };
+
+            let playback_stream = device.build_output_stream(
+                &config.into(),
                 move |data: &mut [f32], _: &_| {
                     let requested_count = data.len();
                     let read_count = consumer.pop_slice(data);
                     data.iter_mut()
-                        .for_each(|s| *s = *s * volume as f32 / 100.0);
+                        .for_each(|s| *s = *s * *volume.borrow() as f32 / 100.0);
                     if read_count < requested_count {
                         trace!("input stream fell behind: try increasing latency");
                     }
@@ -501,151 +567,149 @@ impl ClientController {
                 None,
             )?;
 
-            debug!("Starting playback");
             playback_stream.play()?;
             loop {
-                if let Ok(changed) = player_close_rx.has_changed() {
-                    if changed && *player_close_rx.borrow_and_update() {
-                        break;
-                    }
+                if child_token.is_cancelled() {
+                    break;
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            debug!("Stopping playback");
             playback_stream.pause()?;
 
             drop(playback_stream);
 
-            debug!("Stopping player task");
-            Ok::<(), anyhow::Error>(())
-        };
+            debug!("Stopping playback task");
 
-        let server_receiver_close_tx = close_tx.clone();
-        let mut server_receiver_close_rx = close_rx.clone();
-        let server_receiver = async move {
-            debug!("Starting server connection task");
+            Ok(())
+        })
+    }
 
-            let mut close_requested = false;
+    pub async fn start(&mut self, server_address: SocketAddr) -> Result<()> {
+        let cancellation_token = CancellationToken::new();
 
-            loop {
-                let data = tokio::select! {
-                    result = recv_data(&mut stream) => {
-                        match result {
-                            Ok(data) => data,
-                            Err(e) => {
-                                error!("{e:?}");
-                                continue;
-                            },
-                        }
-                    },
-                    result = server_receiver_close_rx.changed() => {
-                        if result.is_ok() && *server_receiver_close_rx.borrow_and_update() {
-                            close_requested = true;
-                            vec![]
-                        } else {
-                            error!("Error getting close signal");
-                            continue;
-                        }
+        let device = self
+            .selected_device
+            .as_ref()
+            .ok_or(anyhow!("Could not find default output device"))?;
+
+        let mut tcp_stream = TcpStream::connect(server_address).await?;
+
+        info!("Connected to server {}", server_address);
+
+        // Wait for the socket to be readable
+        tcp_stream.readable().await?;
+
+        // Creating the buffer **after** the `await` prevents it from
+        // being stored in the async task.
+        let client_id: String = loop {
+            match recv_data(&mut tcp_stream).await {
+                Ok(data) => {
+                    let value: OABSMessage = serde_json::from_slice(&data)?;
+                    if let OABSMessage::ClientId { id } = value {
+                        break id;
                     }
-                };
-
-                if close_requested {
-                    if let Err(e) = send_data(&mut stream, "CLOSE".as_bytes()).await {
-                        error!("Failed to send CLOSE: {e:?}");
-                    }
-                    break;
+                    return Err(anyhow!("Client id not found"));
                 }
-
-                let value = match std::str::from_utf8(&data) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-
-                if value == "PING" {
-                    trace!("PING");
-                    loop {
-                        if let Err(e) = send_data(&mut stream, "PONG".as_bytes()).await {
-                            debug!("Error Sending Pong: {e:?}");
-                        } else {
-                            trace!("PONG");
-                            break;
-                        }
-                    }
-                }
-                if value == "CLOSE" {
-                    debug!("Server requested close");
-                    break;
+                Err(e) => {
+                    return Err(e.into());
                 }
             }
+        };
+        debug!("Receiving client_id {:?}", client_id);
 
-            drop(server_receiver_close_rx);
-            server_receiver_close_tx.send(true)?;
-
-            debug!("Stopping server connection task");
-
-            Ok::<(), anyhow::Error>(())
+        // Try to read data, this may still fail with `WouldBlock`
+        // if the readiness event is a false positive.
+        let config = loop {
+            match recv_data(&mut tcp_stream).await {
+                Ok(data) => {
+                    break serde_json::from_slice(&data)
+                        .map(|SupportedStreamConfigDeserialize(dur)| dur)?;
+                }
+                Err(e) => {
+                    return Err(e.into());
+                }
+            }
         };
 
-        let close_task_close_tx = close_tx.clone();
-        let mut close_task_close_rx = close_rx;
+        debug!("Receiving config {:?}", config);
 
-        #[cfg(not(target_os = "windows"))]
-        let close_task = async move {
-            tokio::select! {
-                _ = signal::ctrl_c() => { },
-                _ = close_task_close_rx.changed() => { },
+        // Create a delay in case the input and output devices aren't synced.
+        let latency_frames =
+            (*self.latency.1.borrow() as f32 / 1_000.0) * config.sample_rate().0 as f32;
+        let latency_samples = latency_frames as usize * config.channels() as usize;
 
+        let (encoded_tx, encoded_rx) = mpsc::channel::<(StreamStatus, Vec<u8>)>(20);
+
+        // The buffer to share samples
+        let (mut producer, consumer) = HeapRb::<f32>::new(latency_samples).split();
+
+        debug!("Latency Samples: {latency_samples}");
+
+        // Fill the samples with 0.0 equal to the length of the delay.
+        for _ in 0..latency_samples {
+            // The ring buffer has twice as much space as necessary to add latency here,
+            // so this should never fail
+            producer
+                .try_push(0.0)
+                .map_err(|e| anyhow!("Could not fill buffer: {e}"))?;
+        }
+
+        self.decode_joinh
+            .replace(self.create_decode_task(encoded_rx, producer));
+        self.player_joinh.replace(self.create_playback_task(
+            config,
+            device.clone(),
+            consumer,
+            cancellation_token.child_token(),
+        ));
+        self.stream_receiver_joinh
+            .replace(Self::create_stream_receiver_task(
+                client_id.clone(),
+                server_address,
+                encoded_tx,
+                cancellation_token.child_token(),
+            ));
+        self.server_receiver_joinh
+            .replace(Self::create_server_receiver_task(
+                tcp_stream,
+                cancellation_token.clone(),
+            ));
+
+        self.cancellation_token.replace(cancellation_token);
+
+        Ok(())
+    }
+
+    pub async fn wait(&mut self) -> Result<()> {
+        if let Some(joinh) = self.stream_receiver_joinh.take() {
+            if let Err(e) = joinh.await {
+                error!("{e:?}");
             };
-            close_task_close_tx.send(true)?;
-            return Ok::<(), anyhow::Error>(());
-        };
+        }
+        if let Some(joinh) = self.server_receiver_joinh.take() {
+            if let Err(e) = joinh.await {
+                error!("{e:?}");
+            };
+        }
+        if let Some(joinh) = self.decode_joinh.take() {
+            if let Err(e) = joinh.join() {
+                error!("{e:?}");
+            };
+        }
+        if let Some(joinh) = self.player_joinh.take() {
+            if let Err(e) = joinh.join() {
+                error!("{e:?}");
+            };
+        }
+        Ok(())
+    }
 
-        #[cfg(target_os = "windows")]
-        let close_task = async move {
-            let mut ctrl_c_signal = signal::windows::ctrl_c()?;
-            let mut ctrl_close_signal = signal::windows::ctrl_close()?;
-            let mut ctrl_break_signal = signal::windows::ctrl_break()?;
-            let mut ctrl_logoff_signal = signal::windows::ctrl_logoff()?;
-            let mut ctrl_shutdown_signal = signal::windows::ctrl_shutdown()?;
-            tokio::select! {
-                _ = ctrl_c_signal.recv() => { },
-                _ = ctrl_close_signal.recv() => { },
-                _ = ctrl_break_signal.recv() => { },
-                _ = ctrl_logoff_signal.recv() => { },
-                _ = ctrl_shutdown_signal.recv() => { },
-                _ = close_task_close_rx.changed() => { },
-            }
-            drop(close_task_close_rx);
-            close_task_close_tx.send(true)?;
-            return Ok::<(), anyhow::Error>(());
-        };
-
-        let close_joinh = tokio::spawn(close_task);
-
-        let player_joinh = std::thread::spawn(player_task);
-
-        let (close_res, stream_receiver_res, server_receiver_res) =
-            tokio::join!(close_joinh, stream_receiver_task, server_receiver);
-
-        let player_res = player_joinh.join();
-
-        if let Err(e) = close_res {
-            error!("{e:?}");
-        };
-        if let Err(e) = player_res {
-            error!("{e:?}");
-        };
-        if let Err(e) = stream_receiver_res {
-            error!("{e:?}");
-        };
-        if let Err(e) = server_receiver_res {
-            error!("{e:?}");
-        };
-
-        close_tx.closed().await;
-
+    pub async fn stop(&mut self) -> Result<()> {
+        if let Some(cancellation_token) = self.cancellation_token.take() {
+            cancellation_token.cancel();
+            self.wait().await?;
+        }
         info!("Client closed successfully");
-
         Ok(())
     }
 }

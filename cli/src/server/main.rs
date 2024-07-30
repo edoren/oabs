@@ -51,8 +51,8 @@ struct Opt {
     max_connections: u16,
 
     /// The device to capture audio from
-    #[arg(short, long, value_name = "DEVICE")]
-    device: Option<String>,
+    #[arg(short, long, value_name = "DEVICE_NAME")]
+    device_name: Option<String>,
 
     /// The device to capture audio from
     #[arg(short, long, action = ArgAction::SetTrue)]
@@ -128,8 +128,8 @@ async fn main_wrapper() -> Result<()> {
 
     let mut additional_space = false;
 
-    let device_history = history_file.get("device");
-    let device_name_opt = if let Some(device_name) = opt.device {
+    let device_history = history_file.get("device_name");
+    let device_name_opt = if let Some(device_name) = opt.device_name {
         let device_found = device_names.iter().find(|&d| d == &device_name);
         if let Some(device_name) = device_found {
             Some(device_name.clone())
