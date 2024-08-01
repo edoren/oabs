@@ -15,6 +15,7 @@
                 "fullscreen": false,
                 "height": 320,
                 "resizable": false,
+                "maximizable": false,
                 "title": "OABS [Open Audio Broadcast Software]",
                 "width": 460
             }
