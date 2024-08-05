@@ -6,20 +6,20 @@
 }
 
 // https://github.com/samuelkraft/samuelkraft-next/blob/master/components/blog/nowplaying.module.scss
+$icon_color: orange;
+$icon_size: 13px;
 
 .playing_icon {
     position: relative;
     display: inline-flex;
     justify-content: space-between;
-    width: 13px;
-    height: 13px;
-    // margin-right: 8px;
+    width: $icon_size;
+    height: $icon_size;
 
     & > span {
         width: 3px;
         height: 100%;
-        // background-color: var(--brand);
-        background-color: orange;
+        background-color: $icon_color;
         border-radius: 3px;
         transform-origin: bottom;
         transition: opacity 0.3s ease-out;
@@ -55,5 +55,25 @@
 
     100% {
         transform: scaleY(0.6);
+    }
+}
+
+.loader {
+    width: $icon_size;
+    height: $icon_size;
+    border: 3px solid $icon_color;
+    border-bottom-color: transparent;
+    border-radius: 50%;
+    display: inline-block;
+    box-sizing: border-box;
+    animation: rotation 1s linear infinite;
+}
+
+@keyframes rotation {
+    0% {
+        transform: rotate(0deg);
+    }
+    100% {
+        transform: rotate(360deg);
     }
 }

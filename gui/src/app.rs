@@ -33,6 +33,13 @@ struct ShowDialogArgs {
     kind: String,
 }
 
+#[derive(Clone, PartialEq)]
+enum PlayingStatus {
+    STARTING,
+    PLAYING,
+    STOPPED,
+}
+
 #[component]
 pub fn App() -> impl IntoView {
     const DEFAULT_VOLUME: i32 = 100;
@@ -48,7 +55,7 @@ pub fn App() -> impl IntoView {
     let (selected_device_name, set_selected_device_name) = create_signal(String::new());
 
     let (device_names, set_device_names) = create_signal(Vec::<String>::new());
-    let (is_playing, set_is_playing) = create_signal(false);
+    let (playing_status, set_playing_status) = create_signal(PlayingStatus::STOPPED);
 
     window_event_listener(ev::keydown, |ev| {
         // Prevent F5 or Ctrl+R (Windows/Linux) and Command+R (Mac) from refreshing the page
@@ -80,7 +87,11 @@ pub fn App() -> impl IntoView {
         }
         if let Ok(js_value) = invoke("is_running", JsValue::null()).await {
             if let Ok(is_running) = from_value::<bool>(js_value) {
-                set_is_playing.set(is_running);
+                set_playing_status.set(if is_running {
+                    PlayingStatus::PLAYING
+                } else {
+                    PlayingStatus::STOPPED
+                });
             }
         }
     });
@@ -103,16 +114,12 @@ pub fn App() -> impl IntoView {
 
     let start_pressed = move |ev: MouseEvent| {
         ev.prevent_default();
-        set_is_playing.set(true);
+        set_playing_status.set(PlayingStatus::STARTING);
         spawn_local(async move {
             let server_name = server_name.get_untracked();
             let selected_device_name = selected_device_name.get_untracked();
             let volume = volume.get_untracked();
             let latency = latency.get_untracked();
-
-            if server_name.is_empty() || selected_device_name.is_empty() {
-                return;
-            }
 
             let args = to_value(&StartServerArgs {
                 server_name: server_name,
@@ -135,9 +142,9 @@ pub fn App() -> impl IntoView {
                     .unwrap_or_default();
                     let _ = invoke("show_dialog", args).await;
                 }
-                set_is_playing.set(false);
+                set_playing_status.set(PlayingStatus::STOPPED);
             } else {
-                set_is_playing.set(true);
+                set_playing_status.set(PlayingStatus::PLAYING);
             }
             // set_greet_msg.set(new_msg);
         });
@@ -149,7 +156,7 @@ pub fn App() -> impl IntoView {
             // // Learn more about Tauri commands at https://tauri.app/v1/guides/features/command
             let result = invoke("stop_server", JsValue::null()).await;
             if result.is_ok() {
-                set_is_playing.set(false);
+                set_playing_status.set(PlayingStatus::STOPPED);
             }
             log!("stop_server: {result:?}");
         });
@@ -176,7 +183,7 @@ pub fn App() -> impl IntoView {
                         on:input=move |ev| {
                             set_server_name.set(event_target_value(&ev));
                         }
-                        disabled=move || is_playing.get()
+                        disabled=move || playing_status.get() != PlayingStatus::STOPPED
                     />
                 </div>
             </div>
@@ -195,7 +202,7 @@ pub fn App() -> impl IntoView {
                         set_selected_device_name.set(device_name.clone());
                     }
                     prop:value=move || selected_device_name.get().to_string()
-                    disabled=move || is_playing.get()
+                    disabled=move || playing_status.get() != PlayingStatus::STOPPED
                 >
                     <For
                         each=move || device_names.get()
@@ -238,7 +245,7 @@ pub fn App() -> impl IntoView {
                                 let val = (latency.get() - STEP_LATENCY).max(MIN_LATENCY);
                                 set_latency.set(val);
                             }
-                            disabled=move || is_playing.get()
+                            disabled=move || playing_status.get() != PlayingStatus::STOPPED
                         >
                             <svg
                                 class="w-3 h-3"
@@ -270,7 +277,7 @@ pub fn App() -> impl IntoView {
                                     .map_or(latency.get(), |v| v.max(MIN_LATENCY).min(MAX_LATENCY));
                                 set_latency.set(val);
                             }
-                            disabled=move || is_playing.get()
+                            disabled=move || playing_status.get() != PlayingStatus::STOPPED
                         />
                         <div class="absolute bottom-1 start-1/2 -translate-x-1/2 rtl:translate-x-1/2 flex items-center text-xs text-gray-400 space-x-1 rtl:space-x-reverse">
                             <span>{"Latency (ms)"}</span>
@@ -284,7 +291,7 @@ pub fn App() -> impl IntoView {
                                 let val = (latency.get() + STEP_LATENCY).min(MAX_LATENCY);
                                 set_latency.set(val);
                             }
-                            disabled=move || is_playing.get()
+                            disabled=move || playing_status.get() != PlayingStatus::STOPPED
                         >
                             <svg
                                 class="w-3 h-3"
@@ -305,9 +312,8 @@ pub fn App() -> impl IntoView {
                     </div>
                 </div>
             </div>
-
             <div class="mt-6 grid grid-cols-8">
-                <Show when=move || is_playing.get() fallback=|| view! { <div /> }>
+                <Show when=move || { playing_status.get() == PlayingStatus::PLAYING }>
                     <div class="col-start-1 flex items-center justify-center">
                         <div class="playing_icon">
                             <span />
@@ -316,11 +322,16 @@ pub fn App() -> impl IntoView {
                         </div>
                     </div>
                 </Show>
+                <Show when=move || { playing_status.get() == PlayingStatus::STARTING }>
+                    <div class="col-start-1 flex items-center justify-center">
+                        <span class="loader"></span>
+                    </div>
+                </Show>
                 <div class="col-start-2 col-end-5 flex items-center justify-center">
                     <button
                         class="px-5 py-2.5 text-sm font-medium border rounded-lg focus:ring-4 focus:z-10 focus:outline-none enabled:text-white enabled:bg-blue-700 enabled:hover:bg-blue-800 enabled:focus:ring-blue-300 enabled:dark:bg-blue-600 enabled:dark:hover:bg-blue-700 enabled:dark:focus:ring-blue-800 disabled:text-gray-500 disabled:bg-white disabled:border-gray-200 disabled:focus:ring-gray-100 disabled:dark:focus:ring-gray-700 disabled:dark:bg-gray-800 disabled:dark:text-gray-400 disabled:dark:border-gray-600"
                         on:click=start_pressed
-                        disabled=move || is_playing.get()
+                        disabled=move || playing_status.get() != PlayingStatus::STOPPED
                     >
                         "Start Listening"
                     </button>
@@ -329,7 +340,7 @@ pub fn App() -> impl IntoView {
                     <button
                         class="px-5 py-2.5 text-sm font-medium border rounded-lg focus:ring-4 focus:z-10 focus:outline-none enabled:text-white enabled:bg-blue-700 enabled:hover:bg-blue-800 enabled:focus:ring-blue-300 enabled:dark:bg-blue-600 enabled:dark:hover:bg-blue-700 enabled:dark:focus:ring-blue-800 disabled:text-gray-500 disabled:bg-white disabled:border-gray-200 disabled:focus:ring-gray-100 disabled:dark:focus:ring-gray-700 disabled:dark:bg-gray-800 disabled:dark:text-gray-400 disabled:dark:border-gray-600"
                         on:click=stop_pressed
-                        disabled=move || !is_playing.get()
+                        disabled=move || playing_status.get() == PlayingStatus::STOPPED
                     >
                         "Stop Listening"
                     </button>
