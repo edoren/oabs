@@ -26,9 +26,9 @@ impl MyHistory {
         self.history.front().cloned()
     }
 
-    pub fn get(&self, pos: usize) -> Option<String> {
-        self.history.get(pos).cloned()
-    }
+    // pub fn get(&self, pos: usize) -> Option<String> {
+    //     self.history.get(pos).cloned()
+    // }
 
     pub fn add(&mut self, val: String) {
         if self.no_duplicates {
