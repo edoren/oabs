@@ -13,7 +13,7 @@ use oabs_lib::{
     common::constants::{DEFAULT_LATENCY, DEFAULT_PORT, DEFAULT_VOLUME},
 };
 use serde::{Deserialize, Serialize};
-use tauri::{Emitter, State};
+use tauri::{Emitter, Manager, State};
 use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 use tokio::sync::Mutex;
 mod history;
@@ -249,6 +249,14 @@ pub fn run() -> Result<()> {
     let client_data = ClientData::default();
 
     tauri::Builder::default()
+        .setup(|app| {
+            #[cfg(debug_assertions)] // Only include this code on debug builds
+            if let Some(window) = app.get_webview_window("main") {
+                window.open_devtools();
+                // window.close_devtools();
+            }
+            Ok(())
+        })
         .manage(client_data.clone())
         .invoke_handler(tauri::generate_handler![
             start_server,
@@ -261,8 +269,7 @@ pub fn run() -> Result<()> {
         ])
         .plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
             println!("{}, {argv:?}, {cwd}", app.package_info().name);
-            app.emit("single-instance", Payload { args: argv, cwd })
-                .unwrap();
+            let _ = app.emit("single-instance", Payload { args: argv, cwd });
         }))
         .plugin(tauri_plugin_dialog::init())
         .on_window_event(move |_window, event| match event {
