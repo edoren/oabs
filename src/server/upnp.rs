@@ -1,6 +1,5 @@
 use std::{net::Ipv4Addr, time::Duration};
 
-use anyhow::{anyhow, Result};
 use futures::{pin_mut, TryStreamExt};
 use rupnp::{
     ssdp::{SearchTarget, URN},
@@ -41,25 +40,52 @@ pub struct DeletePortConfig {
     pub protocol: PortMappingProtocol,
 }
 
+pub enum UPnPError {
+    DEFAULT,
+}
+
+impl std::fmt::Debug for UPnPError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "UPnPError")
+    }
+}
+
+impl std::fmt::Display for UPnPError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "UPnPError")
+    }
+}
+
+impl std::error::Error for UPnPError {
+    fn description(&self) -> &str {
+        "WOW"
+    }
+}
+
 pub struct UPnP {
     devices: Vec<Device>,
 }
 
 impl UPnP {
-    pub async fn new() -> Result<Self> {
+    pub async fn new() -> Result<Self, UPnPError> {
         let search_target = SearchTarget::URN(WANIP_CONNECTION);
-        let devices = rupnp::discover(&search_target, Duration::from_secs(3)).await?;
+        let devices = rupnp::discover(&search_target, Duration::from_secs(3))
+            .await
+            .map_err(|_e| UPnPError::DEFAULT)?;
         pin_mut!(devices);
         return Ok(UPnP {
-            devices: devices.try_collect::<Vec<Device>>().await?,
+            devices: devices
+                .try_collect::<Vec<Device>>()
+                .await
+                .map_err(|_e| UPnPError::DEFAULT)?,
         });
     }
 
-    pub async fn add_port(&self, config: &AddPortConfig) -> Result<()> {
+    pub async fn add_port(&self, config: &AddPortConfig) -> Result<(), UPnPError> {
         for device in &self.devices {
             let service = device
                 .find_service(&WANIP_CONNECTION)
-                .expect("searched for RenderingControl, got something else");
+                .ok_or(UPnPError::DEFAULT)?;
 
             for protocol in config.protocol.get_protocols() {
                 let mappings: Vec<(&str, String)> = Vec::from([
@@ -89,7 +115,7 @@ impl UPnP {
         Ok(())
     }
 
-    pub async fn delete_port(&self, config: &DeletePortConfig) -> Result<()> {
+    pub async fn delete_port(&self, config: &DeletePortConfig) -> Result<(), UPnPError> {
         for device in &self.devices {
             let service = device
                 .find_service(&WANIP_CONNECTION)
@@ -117,7 +143,7 @@ impl UPnP {
         Ok(())
     }
 
-    pub async fn get_external_ip_address(&self) -> Result<String> {
+    pub async fn get_external_ip_address(&self) -> Result<String, UPnPError> {
         for device in &self.devices {
             let service = device
                 .find_service(&WANIP_CONNECTION)
@@ -129,11 +155,11 @@ impl UPnP {
             {
                 return Ok(response
                     .get("NewExternalIPAddress")
-                    .ok_or(anyhow!("Could not get external IP"))?
+                    .ok_or(UPnPError::DEFAULT)?
                     .to_string());
             }
         }
 
-        Err(anyhow!("Could not get an external ip"))
+        Err(UPnPError::DEFAULT)
     }
 }

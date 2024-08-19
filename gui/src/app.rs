@@ -44,7 +44,7 @@ enum PlayingStatus {
 pub fn App() -> impl IntoView {
     const DEFAULT_VOLUME: i32 = 100;
 
-    const DEFAULT_LATENCY: i32 = 100;
+    const DEFAULT_LATENCY: i32 = 150;
     const MIN_LATENCY: i32 = 50;
     const MAX_LATENCY: i32 = 500;
     const STEP_LATENCY: i32 = 10;
@@ -81,7 +81,11 @@ pub fn App() -> impl IntoView {
             if let Ok(devices) = from_value::<StartServerArgs>(js_value) {
                 set_volume.set(devices.volume as i32);
                 set_latency.set(devices.latency as i32);
-                set_selected_device_name.set(devices.device_name);
+                if devices.device_name.is_empty() && !device_names.get_untracked().is_empty() {
+                    set_selected_device_name.set(device_names.get_untracked()[0].clone());
+                } else {
+                    set_selected_device_name.set(devices.device_name);
+                }
                 set_server_name.set(devices.server_name);
             }
         }
@@ -146,7 +150,6 @@ pub fn App() -> impl IntoView {
             } else {
                 set_playing_status.set(PlayingStatus::PLAYING);
             }
-            // set_greet_msg.set(new_msg);
         });
     };
 
@@ -268,7 +271,7 @@ pub fn App() -> impl IntoView {
                             id="latency"
                             value=move || latency.get()
                             autocomplete="off"
-                            class="bg-gray-50 border-x-0 border-gray-300 h-11 font-medium text-center text-gray-900 disabled:text-gray-500 text-sm focus:ring-blue-500 focus:border-blue-500 block w-full pb-6 dark:bg-gray-700 dark:border-gray-600 dark:placeholder-gray-400 dark:text-white  disabled:dark:text-gray-400 dark:focus:ring-blue-500 dark:focus:border-blue-500"
+                            class="bg-gray-50 border-x-0 border-gray-300 h-11 font-medium text-center text-gray-900 disabled:text-gray-500 text-sm focus:ring-blue-500 focus:border-blue-500 block w-full pb-4 dark:bg-gray-700 dark:border-gray-600 dark:placeholder-gray-400 dark:text-white  disabled:dark:text-gray-400 dark:focus:ring-blue-500 dark:focus:border-blue-500"
                             placeholder=""
                             prop:value=move || latency.get()
                             on:change=move |ev| {
