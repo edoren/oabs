@@ -13,7 +13,7 @@ use oabs_lib::{
     common::constants::{DEFAULT_LATENCY, DEFAULT_PORT, DEFAULT_VOLUME},
 };
 use serde::{Deserialize, Serialize};
-use tauri::{Emitter, Manager, State};
+use tauri::{Emitter, State};
 use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 use tokio::sync::Mutex;
 mod history;
@@ -249,7 +249,7 @@ pub fn run() -> Result<()> {
     let client_data = ClientData::default();
 
     tauri::Builder::default()
-        .setup(|app| {
+        .setup(|_app| {
             #[cfg(debug_assertions)] // Only include this code on debug builds
             if let Some(window) = app.get_webview_window("main") {
                 window.open_devtools();
