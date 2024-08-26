@@ -5,9 +5,30 @@ use serde::{Deserialize, Serialize};
 use serde_wasm_bindgen::{from_value, to_value};
 use wasm_bindgen::prelude::*;
 
-#[wasm_bindgen]
+mod tauri_api;
+use tauri_api::dialog::{self, ask, message, ConfirmDialogOptions, MessageDialogOptions};
+
+#[wasm_bindgen(js_namespace = ["window", "__TAURI__", "window"])]
 extern "C" {
-    #[wasm_bindgen(catch, js_namespace = ["window", "__TAURI__", "core"])]
+    #[wasm_bindgen]
+    fn getCurrentWindow() -> Window;
+
+    #[derive(Debug)]
+    type LogicalSize;
+
+    #[wasm_bindgen(constructor)]
+    fn new(width: u32, height: u32) -> LogicalSize;
+
+    #[derive(Debug)]
+    type Window;
+
+    #[wasm_bindgen(catch, method)]
+    async fn setSize(this: &Window, size: LogicalSize) -> Result<JsValue, JsValue>;
+}
+
+#[wasm_bindgen(js_namespace = ["window", "__TAURI__", "core"])]
+extern "C" {
+    #[wasm_bindgen(catch)]
     async fn invoke(cmd: &str, args: JsValue) -> Result<JsValue, JsValue>;
 }
 
@@ -98,6 +119,24 @@ pub fn App() -> impl IntoView {
                 });
             }
         }
+
+        if let Some(main_element) = document().get_element_by_id("main_oabs") {
+            if let Ok(Some(style)) = window().get_computed_style(&main_element) {
+                if let Ok(margin) = style.get_property_value("margin") {
+                    let margin_value: u32 = margin
+                        .strip_suffix("px")
+                        .and_then(|val| val.parse().ok())
+                        .unwrap_or(20);
+
+                    let _ = getCurrentWindow()
+                        .setSize(LogicalSize::new(
+                            main_element.client_width() as u32 + margin_value * 2,
+                            main_element.client_height() as u32 + margin_value * 2,
+                        ))
+                        .await;
+                }
+            }
+        }
     });
 
     // on_cleanup(move || { });
@@ -138,15 +177,19 @@ pub fn App() -> impl IntoView {
 
             log!("start_server: {result:?}");
             if let Err(js_err) = result {
-                if let Some(error_msg) = js_err.as_string() {
-                    let args = to_value(&ShowDialogArgs {
-                        message: error_msg,
-                        kind: "error".into(),
-                    })
-                    .unwrap_or_default();
-                    let _ = invoke("show_dialog", args).await;
-                }
                 set_playing_status.set(PlayingStatus::STOPPED);
+                if let Some(error_msg) = js_err.as_string() {
+                    let result = message(
+                        &error_msg,
+                        Some(MessageDialogOptions {
+                            title: None,
+                            kind: Some(dialog::DialogKind::ERROR),
+                            ok_label: None,
+                        }),
+                    )
+                    .await;
+                    log!("message: {result:?}");
+                }
             } else {
                 set_playing_status.set(PlayingStatus::PLAYING);
             }
@@ -166,7 +209,7 @@ pub fn App() -> impl IntoView {
     };
 
     view! {
-        <main class="container">
+        <main id="main_oabs" class="container m-5">
             <div>
                 <label
                     for="server-name"

@@ -13,7 +13,7 @@
         "windows": [
             {
                 "fullscreen": false,
-                "height": 320,
+                "height": 324,
                 "resizable": false,
                 "maximizable": false,
                 "title": "OABS [Open Audio Broadcast Software]",

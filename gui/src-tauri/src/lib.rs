@@ -13,7 +13,7 @@ use oabs_lib::{
     common::constants::{DEFAULT_LATENCY, DEFAULT_PORT, DEFAULT_VOLUME},
 };
 use serde::{Deserialize, Serialize};
-use tauri::{Emitter, State};
+use tauri::{Emitter, Manager, State};
 use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 use tokio::sync::Mutex;
 mod history;
@@ -174,28 +174,6 @@ async fn get_history() -> Result<HistoryData, String> {
     })
 }
 
-#[tauri::command]
-fn show_dialog(
-    app_handle: tauri::AppHandle,
-    window: tauri::Window,
-    message: String,
-    kind: Option<&str>,
-) -> Result<(), String> {
-    let dialog_kind = match kind {
-        Some("info") => MessageDialogKind::Info,
-        Some("warning") => MessageDialogKind::Warning,
-        Some("error") => MessageDialogKind::Error,
-        _ => MessageDialogKind::Info,
-    };
-    app_handle
-        .dialog()
-        .message(message)
-        .kind(dialog_kind)
-        .parent(&window)
-        .show(|_e| {});
-    Ok(())
-}
-
 #[derive(Clone, serde::Serialize)]
 struct Payload {
     args: Vec<String>,
@@ -251,9 +229,8 @@ pub fn run() -> Result<()> {
     tauri::Builder::default()
         .setup(|_app| {
             #[cfg(debug_assertions)] // Only include this code on debug builds
-            if let Some(window) = app.get_webview_window("main") {
+            if let Some(window) = _app.get_webview_window("main") {
                 window.open_devtools();
-                // window.close_devtools();
             }
             Ok(())
         })
@@ -264,8 +241,7 @@ pub fn run() -> Result<()> {
             get_devices,
             get_history,
             set_volume,
-            is_running,
-            show_dialog
+            is_running
         ])
         .plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
             println!("{}, {argv:?}, {cwd}", app.package_info().name);
