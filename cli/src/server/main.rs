@@ -93,7 +93,14 @@ async fn main_wrapper() -> Result<()> {
         .with_filter(default_filter(LevelFilter::DEBUG))
         .boxed();
 
+    let timer = time::format_description::parse(
+        "[year]-[month padding:zero]-[day padding:zero] [hour]:[minute]:[second]",
+    )?;
+    let time_offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
+    let timer = tracing_subscriber::fmt::time::OffsetTime::new(time_offset, timer);
+
     let stdout_layer = tracing_subscriber::fmt::layer()
+        .with_timer(timer)
         .with_filter(default_filter(LevelFilter::DEBUG))
         .boxed();
 
