@@ -28,4 +28,4 @@ tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "time"] }
 strum = { version = "0.26", features = ["derive"] }
 oabs_lib = { path = "../lib" }
-time = { version = "0.3.36", features = ["local-offset"] }
+time = { version = "0.3", features = ["local-offset"] }
