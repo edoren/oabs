@@ -14,7 +14,6 @@ use oabs_lib::{
 };
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager, State};
-use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 use tokio::sync::Mutex;
 mod history;
 use history::HistoryFile;
@@ -86,16 +85,6 @@ async fn start_server(
     if unlocked_data.instance.is_some() {
         return Err("The server is already running".into());
     }
-    // let cancellation_token = {
-
-    //     if unlocked_data.cancellation_token.is_some() {
-    //         return Err("The server is already running".into());
-    //     }
-    //     unlocked_data
-    //         .cancellation_token
-    //         .replace(cancellation_token.clone());
-    //     cancellation_token
-    // };
 
     let mut history_file = get_history_file().map_err(|e| format!("{e}"))?;
     history_file.get("server_name").add(server_name);
