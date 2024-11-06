@@ -175,7 +175,8 @@ unsafe fn decode_next_package<P: Producer<Item = f32>>(
 
     producer: &mut P,
 ) -> Result<()> {
-    let convsize = 4096 / vi.assume_init_ref().channels;
+    let num_channels = vi.assume_init_ref().channels as usize;
+    let convsize = 4096 / num_channels;
 
     let buffer_ptr = ogg_sync_buffer(oy.as_mut_ptr(), packet.len().try_into()?).cast::<u8>();
     let decode_buffer = std::slice::from_raw_parts_mut(buffer_ptr, packet.len());
@@ -217,21 +218,34 @@ unsafe fn decode_next_package<P: Producer<Item = f32>>(
                     // values (-1.0 <= range <= 1.0) to whatever PCM format and write it out
                     let mut pcm: *mut *mut f32 = std::ptr::null_mut();
                     loop {
-                        let samples = vorbis_synthesis_pcmout(vd.as_mut_ptr(), &mut pcm);
+                        let samples = vorbis_synthesis_pcmout(vd.as_mut_ptr(), &mut pcm) as usize;
                         if samples == 0 {
                             break;
                         }
 
                         let bout = std::cmp::min(samples, convsize);
 
-                        // Get the channel 1
-                        let mono = *pcm.offset(0);
-                        let data = std::slice::from_raw_parts(mono, bout as usize);
+                        // Gether the channel data
+                        let data: Vec<&[f32]> = (0..num_channels)
+                            .map(|channel_num| {
+                                let channel_data = *pcm.offset(channel_num as isize);
+                                std::slice::from_raw_parts(channel_data, bout)
+                            })
+                            .collect();
 
-                        producer.push_slice(data);
+                        // Interlace the audio so cpal can play it
+                        // E.g for 2 channels:  [[L1, L2, L3], [R1, R2, R3]] -> [L0, R0, L1, R1, L2, R2]
+                        let mut interlaced_data = Vec::with_capacity(samples * bout);
+                        for sample_num in 0..bout {
+                            for channel_num in 0..num_channels {
+                                interlaced_data.push(data[channel_num][sample_num]);
+                            }
+                        }
+
+                        producer.push_slice(&interlaced_data);
 
                         // Tell libvorbis how many samples we actually consumed
-                        vorbis_synthesis_read(vd.as_mut_ptr(), bout);
+                        vorbis_synthesis_read(vd.as_mut_ptr(), bout as i32);
                     }
                 }
             }

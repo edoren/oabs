@@ -339,15 +339,19 @@ async fn stream_server(
         }
 
         let audio_channels = unsafe { vi.assume_init_ref().channels as usize };
+        let sample_count = raw_samples.len() / audio_channels;
 
-        let mut audio_block: Vec<Vec<f32>> = Vec::new();
-        for _ in 0..audio_channels - 1 {
-            audio_block.push(raw_samples.clone());
-        }
-        audio_block.push(raw_samples);
+        // Deinterlace the audio obtained from cpal
+        // E.g for 2 channels: [L0, R0, L1, R1, L2, R2] -> [[L1, L2, L3], [R1, R2, R3]]
+        let audio_block: Vec<Vec<f32>> = (0..audio_channels)
+            .map(|channel| {
+                (0..sample_count)
+                    .map(|sample| raw_samples[sample * audio_channels + channel])
+                    .collect()
+            })
+            .collect();
 
         {
-            let sample_count = audio_block[0].len();
             let encoder_buffer = unsafe {
                 slice::from_raw_parts_mut(
                     vorbis_analysis_buffer(vd.as_mut_ptr(), sample_count.try_into()?),
