@@ -85,9 +85,9 @@ jobs:
 
       - name: Run Tauri (Android Only)
         if: matrix.name == 'Android'
-        run: |
-          export NDK_HOME="$ANDROID_HOME/ndk/$(ls -1 $ANDROID_HOME/ndk)"
-          npx tauri android build --split-per-abi
+        env:
+          NDK_HOME: /usr/local/lib/android/sdk/ndk/27.2.12479018
+        run: npx tauri android build --split-per-abi
 
       - uses: tauri-apps/tauri-action@v0
         if: matrix.name != 'Android'
