@@ -16,13 +16,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: "macos-latest"
+          - name: "MacOS ARM"
+            platform: "macos-latest"
             args: "--target aarch64-apple-darwin"
-          - platform: "macos-latest"
+          - name: "MacOS x64"
+            platform: "macos-latest"
             args: "--target x86_64-apple-darwin"
-          - platform: "ubuntu-latest"
+          - name: "Android"
+            platform: "ubuntu-latest"
             args: ""
-          - platform: "windows-latest"
+          - name: "Ubuntu"
+            platform: "ubuntu-latest"
+            args: ""
+          - name: "Windows"
+            platform: "windows-latest"
             args: ""
 
     runs-on: ${{ matrix.platform }}
@@ -36,7 +43,7 @@ jobs:
           targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
       - name: Install Dependencies (Ubuntu Only)
-        if: matrix.platform == 'ubuntu-latest' # This must match the platform value defined above.
+        if: matrix.name == 'Ubuntu'
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libasound2-dev
@@ -48,7 +55,33 @@ jobs:
       - name: Install WASM Rust Target
         run: rustup target add wasm32-unknown-unknown
 
+      - name: Set Up JDK 17 (Android Only)
+        if: matrix.name == 'Android'
+        uses: actions/setup-java@v3
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Android SDK (Android Only)
+        if: matrix.name == 'Android'
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK (Android Only)
+        if: matrix.name == 'Android'
+        run: sdkmanager --install "ndk;27.2.12479018"
+
+      - name: Install Android Rust Targets (Android Only)
+        if: matrix.name == 'Android'
+        run: rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
+
+      - name: Run Tauri (Android Only)
+        if: matrix.name == 'Android'
+        run: |
+          export NDK_HOME="$ANDROID_HOME/ndk/$(ls -1 $ANDROID_HOME/ndk)"
+          cargo tauri android build --split-per-abi
+
       - uses: tauri-apps/tauri-action@v0
+        if: matrix.name != 'Android'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
