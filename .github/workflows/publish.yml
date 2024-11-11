@@ -36,6 +36,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
       - name: Install Rust Stable
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -59,8 +64,8 @@ jobs:
         if: matrix.name == 'Android'
         uses: actions/setup-java@v3
         with:
-          java-version: '17'
-          distribution: 'temurin'
+          java-version: "17"
+          distribution: "temurin"
 
       - name: Setup Android SDK (Android Only)
         if: matrix.name == 'Android'
@@ -74,11 +79,15 @@ jobs:
         if: matrix.name == 'Android'
         run: rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
 
+      - name: Setup Tauri CLI (Android Only)
+        if: matrix.name == 'Android'
+        run: npm install -g @tauri-apps/cli@latest
+
       - name: Run Tauri (Android Only)
         if: matrix.name == 'Android'
         run: |
           export NDK_HOME="$ANDROID_HOME/ndk/$(ls -1 $ANDROID_HOME/ndk)"
-          cargo tauri android build --split-per-abi
+          npx tauri android build --split-per-abi
 
       - uses: tauri-apps/tauri-action@v0
         if: matrix.name != 'Android'
