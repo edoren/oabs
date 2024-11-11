@@ -69,7 +69,7 @@ async fn main_wrapper() -> Result<()> {
 
     let app_config_dir = dirs::config_dir()
         .ok_or(anyhow!("Could not get config dir"))?
-        .join("oabs_server");
+        .join("me.edoren.oabs-server");
 
     // Logging
 

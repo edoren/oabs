@@ -69,7 +69,7 @@ async fn cli() -> Result<()> {
 
     let app_config_dir = dirs::config_dir()
         .ok_or(anyhow!("Could not get config dir"))?
-        .join("oabs");
+        .join("me.edoren.oabs-client");
 
     // Logging
 
