@@ -13,7 +13,7 @@ use oabs_lib::{
     common::constants::{DEFAULT_LATENCY, DEFAULT_PORT, DEFAULT_VOLUME},
 };
 use serde::{Deserialize, Serialize};
-use tauri::{Emitter, Manager, State};
+use tauri::{path::PathResolver, AppHandle, Manager, Runtime, State};
 use tokio::sync::Mutex;
 mod history;
 use history::HistoryFile;
@@ -36,10 +36,10 @@ struct HistoryData {
     volume: u32,
 }
 
-fn get_history_file() -> Result<HistoryFile> {
-    let app_config_dir = dirs::config_dir()
-        .ok_or(anyhow!("Could not get config dir"))?
-        .join("oabs");
+fn get_history_file<R: Runtime>(path_resolver: &PathResolver<R>) -> Result<HistoryFile> {
+    let app_config_dir = path_resolver
+        .app_config_dir()
+        .map_err(|e| anyhow!("Could not get config dir: {e}"))?;
     HistoryFile::new(&app_config_dir.join("history.json"), Some(10), true)
 }
 
@@ -71,11 +71,12 @@ type ClientData = Arc<Mutex<ClientState>>;
 
 #[tauri::command]
 async fn start_server(
+    app_handle: AppHandle,
     data: State<'_, ClientData>,
     server_name: String,
     latency: u32,
     volume: u32,
-    device_name: String,
+    device_name: Option<String>,
 ) -> Result<(), String> {
     let server_address =
         parse_server_name(&server_name).ok_or("Invalid server name".to_string())?;
@@ -86,18 +87,22 @@ async fn start_server(
         return Err("The server is already running".into());
     }
 
-    let mut history_file = get_history_file().map_err(|e| format!("{e}"))?;
-    history_file.get("server_name").add(server_name);
-    history_file.get("device_name").add(device_name.clone());
-    history_file.get("latency").add(latency.to_string());
-    history_file.get("volume").add(volume.to_string());
-    drop(history_file);
+    if let Ok(mut history_file) = get_history_file(app_handle.path()).map_err(|e| format!("{e}")) {
+        history_file.get("server_name").add(server_name);
+        if let Some(device_name) = device_name.clone() {
+            history_file.get("device_name").add(device_name);
+        }
+        history_file.get("latency").add(latency.to_string());
+        history_file.get("volume").add(volume.to_string());
+    }
 
     let mut controller = ClientController::new();
 
     controller.set_latency(latency);
     controller.set_volume(volume);
-    controller.set_device_name(device_name);
+    if let Some(device_name) = device_name {
+        controller.set_device_name(device_name);
+    }
 
     controller
         .start(server_address)
@@ -139,8 +144,8 @@ fn get_devices() -> Vec<String> {
 }
 
 #[tauri::command]
-async fn get_history() -> Result<HistoryData, String> {
-    let mut history_file = get_history_file().map_err(|e| format!("{e}"))?;
+async fn get_history(app_handle: AppHandle) -> Result<HistoryData, String> {
+    let mut history_file = get_history_file(app_handle.path()).map_err(|e| format!("{e}"))?;
     Ok(HistoryData {
         server_name: history_file
             .get("server_name")
@@ -163,32 +168,32 @@ async fn get_history() -> Result<HistoryData, String> {
     })
 }
 
+#[cfg(not(target_os = "android"))]
 #[derive(Clone, serde::Serialize)]
 struct Payload {
     args: Vec<String>,
     cwd: String,
 }
 
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run() -> Result<()> {
-    let app_config_dir = dirs::config_dir()
-        .ok_or(anyhow!("Could not get config dir"))?
-        .join("oabs");
+fn setup_logging<R: Runtime>(path_resolver: &PathResolver<R>) -> Result<()> {
+    let mut layers = Vec::new();
 
-    // Logging
-    let logs_dir = app_config_dir.join("logs");
     let default_filter = |filter: LevelFilter| {
         EnvFilter::builder()
             .with_default_directive(filter.into())
             .from_env_lossy()
     };
 
+    let log_dir = path_resolver
+        .app_log_dir()
+        .map_err(|e| anyhow!("Could not get log dir: {e}"))?;
+
     let file_appender = RollingFileAppender::builder()
         .max_log_files(7)
         .rotation(Rotation::DAILY)
         .filename_prefix("oabs")
         .filename_suffix("log")
-        .build(logs_dir.clone())?;
+        .build(log_dir.clone())?;
 
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
     let file_layer = tracing_subscriber::fmt::layer()
@@ -196,31 +201,40 @@ pub fn run() -> Result<()> {
         .with_ansi(false)
         .with_filter(default_filter(LevelFilter::DEBUG))
         .boxed();
+    layers.push(file_layer);
 
     #[cfg(debug_assertions)]
     let default_stdout_level_filter = LevelFilter::DEBUG;
     #[cfg(not(debug_assertions))]
     let default_stdout_level_filter = LevelFilter::INFO;
-
     let stdout_layer = tracing_subscriber::fmt::layer()
         .with_filter(default_filter(default_stdout_level_filter))
         .boxed();
-
-    let mut layers = Vec::new();
-    layers.push(file_layer);
     layers.push(stdout_layer);
+
     tracing_subscriber::registry().with(layers).init();
 
+    Ok(())
+}
+
+pub fn main() -> Result<()> {
     // App
 
     let client_data = ClientData::default();
 
-    tauri::Builder::default()
-        .setup(|_app| {
-            #[cfg(debug_assertions)] // Only include this code on debug builds
-            if let Some(window) = _app.get_webview_window("main") {
+    let mut builder = tauri::Builder::default();
+
+    builder = builder
+        .setup(|app| {
+            // Only include this code on debug builds and desktops
+            #[cfg(debug_assertions)]
+            if let Some(window) = app.get_webview_window("main") {
                 window.open_devtools();
             }
+
+            // Logging
+            setup_logging(app.handle().path())?;
+
             Ok(())
         })
         .manage(client_data.clone())
@@ -231,11 +245,17 @@ pub fn run() -> Result<()> {
             get_history,
             set_volume,
             is_running
-        ])
-        .plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
+        ]);
+
+    #[cfg(not(target_os = "android"))]
+    {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
             println!("{}, {argv:?}, {cwd}", app.package_info().name);
-            let _ = app.emit("single-instance", Payload { args: argv, cwd });
-        }))
+            let _ = tauri::Emitter::emit(app, "single-instance", Payload { args: argv, cwd });
+        }));
+    }
+
+    builder
         .plugin(tauri_plugin_dialog::init())
         .on_window_event(move |_window, event| match event {
             tauri::WindowEvent::CloseRequested { .. } => {
@@ -251,4 +271,11 @@ pub fn run() -> Result<()> {
         .expect("error while running tauri application");
 
     Ok(())
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    if let Err(err) = main() {
+        error!("Application failed with error: {err}");
+    }
 }

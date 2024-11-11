@@ -1,23 +1,24 @@
 {
+    "$schema": "https://schema.tauri.app/config/2",
     "productName": "OABS",
     "version": "0.1.0",
     "identifier": "me.edoren.oabs-client",
     "build": {
         "beforeDevCommand": "trunk serve",
+        "devUrl": "http://localhost:1420",
         "beforeBuildCommand": "trunk build",
-        "frontendDist": "../dist",
-        "devUrl": "http://localhost:1420"
+        "frontendDist": "../dist"
     },
     "app": {
         "withGlobalTauri": true,
         "windows": [
             {
-                "fullscreen": false,
-                "height": 324,
-                "resizable": false,
-                "maximizable": false,
                 "title": "OABS [Open Audio Broadcast Software]",
-                "width": 460
+                "width": 460,
+                "height": 324,
+                "fullscreen": false,
+                "resizable": false,
+                "maximizable": false
             }
         ],
         "security": {
@@ -34,6 +35,5 @@
             "icons/icon.icns",
             "icons/icon.ico"
         ]
-    },
-    "plugins": {}
+    }
 }

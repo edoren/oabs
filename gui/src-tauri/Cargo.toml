@@ -16,7 +16,6 @@ tauri-build = { version = "2.0", features = [] }
 
 [dependencies]
 anyhow = "1.0"
-dirs = "5.0"
 log = "0.4"
 oabs_lib = { path = "../../lib" }
 serde = { version = "1", features = ["derive"] }
@@ -32,3 +31,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [features]
 # This feature is used for production builds or when a dev server is not specified, DO NOT REMOVE!!
 custom-protocol = ["tauri/custom-protocol"]
+
+[profile.dev]
+incremental = true # Compile your binary in smaller steps.
+
+[profile.release]
+codegen-units = 1 # Allows LLVM to perform better optimization.
+lto = true        # Enables link-time-optimizations.
+opt-level = "z"   # Prioritizes small binary size. Use `3` if you prefer speed.
+panic = "abort"   # Higher performance by disabling panic handlers.
+strip = true      # Ensures debug symbols are removed.
