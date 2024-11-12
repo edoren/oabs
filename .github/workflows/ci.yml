@@ -63,7 +63,7 @@ jobs:
         include:
           - name: "MacOS ARM"
             platform: "macos-latest"
-            args: "--target aarch64-apple-darwin"
+            dependencies: "--target aarch64-apple-darwin"
           - name: "MacOS x64"
             platform: "macos-latest"
             args: "--target x86_64-apple-darwin"
@@ -102,6 +102,16 @@ jobs:
           brew update
           brew install --force openssl@3
           brew link --force openssl@3
+
+      - name: Fix libssl3 issue on MacOS # https://github.com/actions/runner-images/pull/10851
+        run: | 
+          if [ ! -f /usr/local/opt/openssl@3/lib/libssl.3.dylib ]; then
+              mkdir -p /usr/local/opt/openssl@3/lib/
+              ln -s /opt/homebrew/opt/openssl@3/lib/libssl.3.dylib /usr/local/opt/openssl@3/lib/libssl.3.dylib
+              export PATH=/opt/homebrew/opt/openssl@3/bin:$PATH
+              echo "Created symbolic links"
+          fi
+          ls -al /usr/local/opt/openssl@3/lib
 
       - name: Install Trunk
         uses: jetli/trunk-action@v0.5.0
