@@ -23,10 +23,11 @@ jobs:
       - name: Install Rust Stable
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install Cargo B(inary)Install
+        uses: cargo-bins/cargo-binstall@main
+
       - name: Install Trunk
-        uses: jetli/trunk-action@v0.5.0
-        with:
-          version: "latest"
+        run: cargo binstall trunk
 
       - name: Install WASM Rust Target
         run: rustup target add wasm32-unknown-unknown
@@ -64,8 +65,6 @@ jobs:
           - name: "MacOS ARM"
             platform: "macos-latest"
             args: "--target aarch64-apple-darwin"
-            dependencies: |
-
           - name: "MacOS x64"
             platform: "macos-latest"
             args: "--target x86_64-apple-darwin"
