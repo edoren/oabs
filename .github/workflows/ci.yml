@@ -100,7 +100,7 @@ jobs:
         if: matrix.platform == 'macos-latest'
         run: |
           brew update
-          brew install --force openssl@3
+          arch -arm64 brew install --force openssl@3
           brew link --force openssl@3
 
       - name: Fix libssl.3.dylib issue (MacOS Only) # https://github.com/actions/runner-images/pull/10851
