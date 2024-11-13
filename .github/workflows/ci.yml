@@ -63,7 +63,9 @@ jobs:
         include:
           - name: "MacOS ARM"
             platform: "macos-latest"
-            dependencies: "--target aarch64-apple-darwin"
+            args: "--target aarch64-apple-darwin"
+            dependencies: |
+
           - name: "MacOS x64"
             platform: "macos-latest"
             args: "--target x86_64-apple-darwin"
@@ -90,34 +92,17 @@ jobs:
           # Those targets are only used on macos runners so it's in an `if` to slightly speed up windows and linux builds.
           targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
+      - name: Install Cargo B(inary)Install
+        uses: cargo-bins/cargo-binstall@main
+
+      - name: Install Trunk
+        run: cargo binstall trunk
+
       - name: Install Dependencies (Ubuntu Only)
         if: matrix.name == 'Ubuntu'
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libasound2-dev
-
-      - name: Install Dependencies (MacOS Only)
-        if: matrix.platform == 'macos-latest'
-        run: |
-          brew update
-          arch -arm64 brew install --force openssl@3
-          brew link --force openssl@3
-
-      - name: Fix libssl.3.dylib issue (MacOS Only) # https://github.com/actions/runner-images/pull/10851
-        if: matrix.platform == 'macos-latest'
-        run: | 
-          if [ ! -f /usr/local/opt/openssl@3/lib/libssl.3.dylib ]; then
-              sudo mkdir -p /usr/local/opt/openssl@3/lib/
-              sudo ln -s /opt/homebrew/opt/openssl@3/lib/libssl.3.dylib /usr/local/opt/openssl@3/lib/libssl.3.dylib
-              export PATH=/opt/homebrew/opt/openssl@3/bin:$PATH
-              echo "Created symbolic links"
-          fi
-          ls -al /usr/local/opt/openssl@3/lib
-
-      - name: Install Trunk
-        uses: jetli/trunk-action@v0.5.0
-        with:
-          version: "v0.21.4"
 
       - name: Install WASM Rust Target
         run: rustup target add wasm32-unknown-unknown
