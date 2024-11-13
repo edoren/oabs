@@ -103,11 +103,12 @@ jobs:
           brew install --force openssl@3
           brew link --force openssl@3
 
-      - name: Fix libssl3 issue on MacOS # https://github.com/actions/runner-images/pull/10851
+      - name: Fix libssl.3.dylib issue (MacOS Only) # https://github.com/actions/runner-images/pull/10851
+        if: matrix.platform == 'macos-latest'
         run: | 
           if [ ! -f /usr/local/opt/openssl@3/lib/libssl.3.dylib ]; then
-              mkdir -p /usr/local/opt/openssl@3/lib/
-              ln -s /opt/homebrew/opt/openssl@3/lib/libssl.3.dylib /usr/local/opt/openssl@3/lib/libssl.3.dylib
+              sudo mkdir -p /usr/local/opt/openssl@3/lib/
+              sudo ln -s /opt/homebrew/opt/openssl@3/lib/libssl.3.dylib /usr/local/opt/openssl@3/lib/libssl.3.dylib
               export PATH=/opt/homebrew/opt/openssl@3/bin:$PATH
               echo "Created symbolic links"
           fi
