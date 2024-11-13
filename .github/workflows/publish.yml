@@ -2,38 +2,16 @@ name: "publish"
 
 on:
   workflow_dispatch:
-    inputs:
-      build_windows:
-        type: boolean
-        default: true
-        description: "Build Windows"
-      build_linux:
-        type: boolean
-        default: true
-        description: "Build Linux"
-      build_mac:
-        type: boolean
-        default: true
-        description: "Build Mac ARM"
-      build_mac_intel:
-        type: boolean
-        default: true
-        description: "Build Mac x86_64 Intel"
-      build_android:
-        type: boolean
-        default: true
-        description: "Build Android APK"
   push:
     tags:
       - "v*.*.*"
 
-# This workflow will trigger on each push to the `release` branch to create or update a GitHub release, build your app, and upload the artifacts to the release.
-
 jobs:
   publish-tauri-android:
     name: Publish Android
-    if: ${{ inputs.build_android }}
     runs-on: "ubuntu-latest"
+    env:
+      NDK_VERSION: "27.2.12479018"
     steps:
       - uses: actions/checkout@v4
 
@@ -45,10 +23,11 @@ jobs:
       - name: Install Rust Stable
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install Cargo B(inary)Install
+        uses: cargo-bins/cargo-binstall@main
+
       - name: Install Trunk
-        uses: jetli/trunk-action@v0.5.0
-        with:
-          version: "latest"
+        run: cargo binstall trunk
 
       - name: Install WASM Rust Target
         run: rustup target add wasm32-unknown-unknown
@@ -63,7 +42,7 @@ jobs:
         uses: android-actions/setup-android@v3
 
       - name: Install Android NDK
-        run: sdkmanager --install "ndk;27.2.12479018"
+        run: sdkmanager --install "ndk;${{ env.NDK_VERSION }}"
 
       - name: Install Android Rust Targets
         run: rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
@@ -73,8 +52,21 @@ jobs:
 
       - name: Run Tauri Build
         env:
-          NDK_HOME: /usr/local/lib/android/sdk/ndk/27.2.12479018
-        run: npx tauri android build --split-per-abi
+          NDK_HOME: /usr/local/lib/android/sdk/ndk/${{ env.NDK_VERSION }}
+        run: npx tauri android build
+
+      - uses: SebRollen/toml-action@v1.2.0
+        id: read_toml
+        with:
+          file: "gui/Cargo.toml"
+          field: "package.version"
+
+      - name: Release to Github
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          name: Release ${{ steps.read_toml.outputs.value }}
+          files: "gui/src-tauri/gen/android/app/build/outputs/apk/**/*.apk"
 
   publish-tauri:
     permissions:
@@ -85,16 +77,22 @@ jobs:
         include:
           - name: "MacOS ARM"
             platform: "macos-latest"
-            args: "--target aarch64-apple-darwin"
+            build_args: "--target aarch64-apple-darwin"
+            build_files: "target/**/bundle/**/*.dmg"
           - name: "MacOS x64"
             platform: "macos-latest"
-            args: "--target x86_64-apple-darwin"
+            build_args: "--target x86_64-apple-darwin"
+            build_files: "target/**/bundle/**/*.dmg"
           - name: "Ubuntu"
             platform: "ubuntu-latest"
-            args: ""
+            build_args: ""
+            build_files: "target/**/bundle/**/*.deb"
           - name: "Windows"
             platform: "windows-latest"
-            args: ""
+            build_args: ""
+            build_files: |
+              "target/**/bundle/**/*.exe"
+              "target/**/bundle/**/*.msi"
 
     name: "Publish ${{ matrix.name }}"
     runs-on: ${{ matrix.platform }}
@@ -112,23 +110,17 @@ jobs:
           # Those targets are only used on macos runners so it's in an `if` to slightly speed up windows and linux builds.
           targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
+      - name: Install Cargo B(inary)Install
+        uses: cargo-bins/cargo-binstall@main
+
+      - name: Install Trunk
+        run: cargo binstall trunk
+
       - name: Install Dependencies (Ubuntu Only)
         if: matrix.name == 'Ubuntu'
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libasound2-dev
-
-      - name: Install Dependencies (MacOS Only)
-        if: matrix.platform == 'macos-latest'
-        run: |
-          brew update
-          brew install --force openssl@3
-          brew link --force openssl@3
-
-      - name: Install Trunk
-        uses: jetli/trunk-action@v0.5.0
-        with:
-          version: "v0.21.4"
 
       - name: Install WASM Rust Target
         run: rustup target add wasm32-unknown-unknown
@@ -139,9 +131,17 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           projectPath: "./gui"
-          # tagName: app-v__VERSION__ # the action automatically replaces \_\_VERSION\_\_ with the app version.
-          # releaseName: "App v__VERSION__"
-          # releaseBody: "See the assets to download this version and install."
-          # releaseDraft: true
-          # prerelease: false
-          args: ${{ matrix.args }}
+          args: ${{ matrix.build_args }}
+
+      - uses: SebRollen/toml-action@v1.2.0
+        id: read_toml
+        with:
+          file: "gui/Cargo.toml"
+          field: "package.version"
+
+      - name: Release to Github
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          name: Release ${{ steps.read_toml.outputs.value }}
+          files: ${{ matrix.build_files }}
