@@ -155,7 +155,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p upload
-          cp -pv "target/${{ matrix.target }}/release/bundle/*/*.*" upload/
+          find "target/${{ matrix.target }}/release/bundle" -mindepth 2 -type f -print0 | xargs -0 cp -pvt upload
 
       - name: Post Build | Upload Artifacts
         uses: actions/upload-artifact@v4
