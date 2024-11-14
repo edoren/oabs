@@ -49,7 +49,7 @@ jobs:
         run: sdkmanager --install "ndk;${{ env.NDK_VERSION }}"
 
       - name: Install Android Rust Targets
-        run: rustup target add ${{ matrix.arch }}-linux-android
+        run: rustup target add ${{ matrix.arch }}-linux-android${{ matrix.arch == 'armv7' && 'eabi' || '' }}
 
       - name: Setup Tauri CLI
         run: npm install -g @tauri-apps/cli@latest
