@@ -40,11 +40,6 @@ jobs:
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
             core.exportVariable('VCPKG_BINARY_SOURCES', 'clear;x-gha,readwrite');
 
-      - name: Setup | Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: lts/*
-
       - name: Setup | Install Rust Stable
         uses: dtolnay/rust-toolchain@stable
 
@@ -78,7 +73,7 @@ jobs:
       - name: Build | Tauri
         env:
           NDK_HOME: /usr/local/lib/android/sdk/ndk/${{ env.NDK_VERSION }}
-        run: npx tauri android build --target ${{ matrix.arch }} --apk
+        run: cargo tauri android build --target ${{ matrix.arch }} --apk
 
   build-tauri:
     strategy:
