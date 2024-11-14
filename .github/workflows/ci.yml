@@ -7,7 +7,7 @@ on:
 
 jobs:
   build-tauri-android:
-    runs-on: "ubuntu-latest"
+    runs-on: "ubuntu-24.04"
     env:
       NDK_VERSION: "27.2.12479018"
     strategy:
@@ -85,21 +85,21 @@ jobs:
         include:
           - name: "MacOS aarch64"
             target: "aarch64-apple-darwin"
-            platform: "macos-latest"
+            platform: "macos-13"
 
           - name: "MacOS x86_64"
             target: "x86_64-apple-darwin"
-            platform: "macos-latest"
+            platform: "macos-14"
 
           - name: "Linux x86_64 GNU"
             target: x86_64-unknown-linux-gnu
-            platform: "ubuntu-latest"
+            platform: "ubuntu-24.04"
             install: |
               sudo apt install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libasound2-dev
 
           - name: "Windows x86_64"
             target: "x86_64-pc-windows-msvc"
-            platform: "windows-latest"
+            platform: "windows-2022"
 
     name: "Build ${{ matrix.name }}"
     runs-on: ${{ matrix.platform }}
@@ -145,15 +145,20 @@ jobs:
       - name: Setup | Install WASM Rust Target
         run: rustup target add wasm32-unknown-unknown
 
+      - name: Setup | Tauri CLI
+        run: cargo binstall tauri-cli@2 -y
+
       - name: Build | Tauri
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: cargo tauri build --target ${{ matrix.target }}
+
+      - name: Post Build | Move Bundles
+        shell: bash
+        run: |
+          mkdir -p upload
+          cp -pv "target/${{ matrix.target }}/release/bundle/*/*.*" upload/
+
+      - name: Post Build | Upload Artifacts
+        uses: actions/upload-artifact@v4
         with:
-          projectPath: "./gui"
-          # tagName: app-v__VERSION__ # the action automatically replaces \_\_VERSION\_\_ with the app version.
-          # releaseName: "App v__VERSION__"
-          # releaseBody: "See the assets to download this version and install."
-          # releaseDraft: true
-          # prerelease: false
-          args: "--target ${{ matrix.target }}"
+          path: upload/*
+          if-no-files-found: error
