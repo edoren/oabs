@@ -151,11 +151,14 @@ jobs:
       - name: Build | Tauri
         run: cargo tauri build --target ${{ matrix.target }}
 
-      # - name: Post Build | Move Bundles
-      #   shell: bash
-      #   run: |
-      #     mkdir -p upload
-      #     find "target/${{ matrix.target }}/release/bundle" -mindepth 2 -type f -print0 | xargs -0 cp -pvt upload
+      - name: Post Build | Move Bundles
+        shell: bash
+        run: |
+          mkdir -p upload
+
+          find "target/${{ matrix.target }}/release/bundle" -mindepth 2 -type f -print0 | while IFS= read -r -d '' file; do 
+              cp -pv "$file" upload
+          done
 
       # - name: Post Build | Upload Artifacts
       #   uses: actions/upload-artifact@v4
