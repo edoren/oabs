@@ -89,7 +89,7 @@ jobs:
 
           - name: "MacOS x86_64"
             target: "x86_64-apple-darwin"
-            platform: "macos-13"
+            platform: "macos-14"
 
           - name: "Linux x86_64 GNU"
             target: x86_64-unknown-linux-gnu
