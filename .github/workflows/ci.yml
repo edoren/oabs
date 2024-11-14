@@ -86,12 +86,10 @@ jobs:
           - name: "MacOS aarch64"
             target: "aarch64-apple-darwin"
             platform: "macos-latest"
-            args: ""
 
           - name: "MacOS x86_64"
             target: "x86_64-apple-darwin"
             platform: "macos-latest"
-            args: "--target x86_64-apple-darwin"
 
           - name: "Linux x86_64 GNU"
             target: x86_64-unknown-linux-gnu
@@ -158,4 +156,4 @@ jobs:
           # releaseBody: "See the assets to download this version and install."
           # releaseDraft: true
           # prerelease: false
-          args: "--target ${{ matrix.target }} ${{ matrix.args }}"
+          args: "--target ${{ matrix.target }}"
