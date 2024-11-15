@@ -86,27 +86,42 @@ jobs:
           - name: "MacOS aarch64"
             target: "aarch64-apple-darwin"
             platform: "macos-14"
+            artifacts: |
+              zip -vr target/aarch64-apple-darwin/release/bundle/macos/OABS.app.zip target/aarch64-apple-darwin/release/bundle/macos/OABS.app/
+              cp -pv target/aarch64-apple-darwin/release/bundle/macos/OABS*.app.zip upload
+              cp -pv target/aarch64-apple-darwin/release/bundle/dmg/OABS*.dmg upload
 
           - name: "MacOS x86_64"
             target: "x86_64-apple-darwin"
             platform: "macos-14"
+            artifacts: |
+              zip -vr target/x86_64-apple-darwin/release/bundle/macos/OABS.app.zip target/x86_64-apple-darwin/release/bundle/macos/OABS.app/
+              cp -pv target/x86_64-apple-darwin/release/bundle/macos/OABS*.app.zip upload
+              cp -pv target/x86_64-apple-darwin/release/bundle/dmg/OABS*.dmg upload
 
           - name: "Linux x86_64 GNU"
             target: x86_64-unknown-linux-gnu
             platform: "ubuntu-24.04"
             install: |
               sudo apt install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libasound2-dev
+            artifacts: |
+              cp -pv target/x86_64-unknown-linux-gnu/release/bundle/deb/OABS*.deb
+              cp -pv target/x86_64-unknown-linux-gnu/release/bundle/rpm/OABS*.rpm
+              cp -pv target/x86_64-unknown-linux-gnu/release/bundle/appimage/OABS*.AppImage
 
           - name: "Windows x86_64"
             target: "x86_64-pc-windows-msvc"
             platform: "windows-2022"
+            artifacts: |
+              cp -pv target/x86_64-pc-windows-msvc/release/bundle/msi/OABS*.msi
+              cp -pv target/x86_64-pc-windows-msvc/release/bundle/nsis/OABS*.exe
 
     name: "Build ${{ matrix.name }}"
     runs-on: ${{ matrix.platform }}
     steps:
       - name: Setup | Checkout
         uses: actions/checkout@v4
-      
+
       - name: Setup | Cache Cargo
         uses: actions/cache@v4
         with:
@@ -151,14 +166,17 @@ jobs:
       - name: Build | Tauri
         run: cargo tauri build --target ${{ matrix.target }}
 
+      - uses: SebRollen/toml-action@v1.2.0
+        id: version
+        with:
+          file: "gui/Cargo.toml"
+          field: "package.version"
+
       - name: Post Build | Move Bundles
         shell: bash
         run: |
           mkdir -p upload
-
-          find "target/${{ matrix.target }}/release/bundle" -mindepth 2 -type f -print0 | while IFS= read -r -d '' file; do 
-              cp -pv "$file" upload
-          done
+          ${{ matrix.artifacts }}
 
       # - name: Post Build | Upload Artifacts
       #   uses: actions/upload-artifact@v4
