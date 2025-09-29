@@ -2,8 +2,8 @@ use std::{net::Ipv4Addr, time::Duration};
 
 use futures::TryStreamExt;
 use rupnp::{
-    ssdp::{SearchTarget, URN},
     Device, Service,
+    ssdp::{SearchTarget, URN},
 };
 
 const WANIP_CONNECTION_VER_1: URN = URN::service("schemas-upnp-org", "WANIPConnection", 1);
@@ -159,7 +159,7 @@ impl UPnP {
         Err(UPnPError::DEFAULT)
     }
 
-    fn get_device_service<'a>(&'a self, device: &'a Device) -> Result<&Service, UPnPError> {
+    fn get_device_service<'a>(&'a self, device: &'a Device) -> Result<&'a Service, UPnPError> {
         for schema in vec![WANIP_CONNECTION_VER_1, WANIP_CONNECTION_VER_2] {
             if let Some(service) = device.find_service(&schema) {
                 return Ok(service);

@@ -1,8 +1,8 @@
 use std::process::ExitCode;
 
-use anyhow::{anyhow, Ok, Result};
+use anyhow::{Ok, Result, anyhow};
 use clap::{ArgAction, Parser, ValueEnum};
-use dialoguer::{theme::ColorfulTheme, FuzzySelect};
+use dialoguer::{FuzzySelect, theme::ColorfulTheme};
 use log::error;
 use oabs_cli::history::HistoryFile;
 use oabs_lib::{common::constants::DEFAULT_PORT, server::ServerController};
@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use strum::{EnumIter, EnumString, IntoEnumIterator, IntoStaticStr};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{
-    filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
+    EnvFilter, Layer, filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt,
 };
 
 #[derive(
@@ -53,6 +53,10 @@ struct Opt {
     /// The device to capture audio from
     #[arg(short, long, value_name = "DEVICE_NAME")]
     device_name: Option<String>,
+
+    /// The device to capture audio from
+    #[arg(long, action = ArgAction::SetTrue)]
+    include_output_devices: bool,
 
     /// The device to capture audio from
     #[arg(short, long, action = ArgAction::SetTrue)]
@@ -112,6 +116,7 @@ async fn main_wrapper() -> Result<()> {
     // App
 
     let mut controller = ServerController::new();
+    controller.set_should_include_output_devices(opt.include_output_devices);
     let mut device_names = controller.get_device_names();
     device_names.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
 
