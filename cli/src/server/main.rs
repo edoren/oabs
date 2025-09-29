@@ -54,7 +54,7 @@ struct Opt {
     #[arg(short, long, value_name = "DEVICE_NAME")]
     device_name: Option<String>,
 
-    /// The device to capture audio from
+    /// Include output devices. Some output devices may not be supported and fail.
     #[arg(long, action = ArgAction::SetTrue)]
     include_output_devices: bool,
 

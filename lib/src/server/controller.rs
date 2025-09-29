@@ -8,23 +8,23 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use aotuv_lancer_vorbis_sys::*;
 use cpal::{
+    Device, DevicesError, SampleFormat, SampleRate, SupportedStreamConfig,
     traits::{DeviceTrait, HostTrait, StreamTrait},
-    Device, SampleFormat, SampleRate, SupportedStreamConfig,
 };
 use local_ip_address::local_ip;
 use log::{debug, error, info, trace};
 use ogg_next_sys::*;
-use rand::{thread_rng, Rng};
+use rand::{Rng, thread_rng};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
     signal,
     sync::{mpsc, watch},
-    task::{yield_now, JoinSet},
-    time::{sleep, sleep_until, timeout_at, Instant},
+    task::{JoinSet, yield_now},
+    time::{Instant, sleep, sleep_until, timeout_at},
 };
 
 use crate::{
@@ -238,7 +238,7 @@ async fn stream_server(
         vorbis_analysis_init(vd.as_mut_ptr(), vi.as_mut_ptr());
         vorbis_block_init(vd.as_mut_ptr(), vb.as_mut_ptr());
 
-        serial_num = thread_rng().gen();
+        serial_num = thread_rng().r#gen();
         debug!("Serial: {}", serial_num);
         ogg_stream_init(os.as_mut_ptr(), serial_num);
 
@@ -513,20 +513,40 @@ async fn upnp_connector(port: u16, mut close_rx: watch::Receiver<bool>) -> Resul
 }
 
 pub struct ServerController {
+    should_include_output_devices: bool,
     selected_device: Option<Device>,
 }
 
 impl ServerController {
     pub fn new() -> Self {
         Self {
+            should_include_output_devices: false,
             selected_device: cpal::default_host().default_input_device(),
         }
     }
 
+    pub fn set_should_include_output_devices(&mut self, should_include_output_devices: bool) {
+        self.should_include_output_devices = should_include_output_devices;
+    }
+
     pub fn get_devices(&self) -> Vec<Device> {
         let host = cpal::default_host();
-        if let Ok(device) = host.input_devices() {
-            device.filter(|x| x.name().is_ok()).collect()
+
+        let devices_result: Result<Vec<_>, DevicesError> =
+            host.input_devices().and_then(|output_devices| {
+                if self.should_include_output_devices {
+                    host.output_devices().map(|input_devices| {
+                        output_devices
+                            .into_iter()
+                            .chain(input_devices.into_iter())
+                            .collect()
+                    })
+                } else {
+                    Ok(output_devices.into_iter().collect())
+                }
+            });
+        if let Ok(devices) = devices_result {
+            devices.into_iter().filter(|x| x.name().is_ok()).collect()
         } else {
             Vec::new()
         }
