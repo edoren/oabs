@@ -12,6 +12,8 @@ path = "src/lib.rs"
 [dependencies]
 anyhow = "1.0"
 aotuv_lancer_vorbis_sys = "0.1"
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
 cpal = { version = "0.15", features = ["oboe-shared-stdcxx"] }
 dirs = "5.0"
 futures = "0.3"

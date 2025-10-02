@@ -26,10 +26,6 @@ impl MyHistory {
         self.history.front().cloned()
     }
 
-    // pub fn get(&self, pos: usize) -> Option<String> {
-    //     self.history.get(pos).cloned()
-    // }
-
     pub fn add(&mut self, val: String) {
         if self.no_duplicates {
             self.history.retain(|v| v != &val);
@@ -74,7 +70,7 @@ impl HistoryFile {
         return self
             .history_map
             .entry(key.to_string())
-            .or_insert(MyHistory::new(self.max_entries, self.no_duplicates));
+            .or_insert_with(|| MyHistory::new(self.max_entries, self.no_duplicates));
     }
 }
 

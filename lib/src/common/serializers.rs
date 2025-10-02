@@ -74,6 +74,8 @@ pub struct SupportedStreamConfigDeserialize(
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OABSMessage {
     ClientConnected {},
+    AuthenticateRequest { salt: String, verifier: Vec<u8> },
+    Authenticate { verifier: Vec<u8> },
     ClientId { id: String },
     ClientDisconnected {},
 }

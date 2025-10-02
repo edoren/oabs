@@ -3,9 +3,9 @@ use std::{
     process::ExitCode,
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::{ArgAction, Parser};
-use dialoguer::{theme::ColorfulTheme, FuzzySelect, Input};
+use dialoguer::{FuzzySelect, Input, Password, theme::ColorfulTheme};
 use log::error;
 use oabs_cli::history::HistoryFile;
 use oabs_lib::{
@@ -15,7 +15,7 @@ use oabs_lib::{
 use tokio::signal;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{
-    filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
+    EnvFilter, Layer, filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt,
 };
 
 #[derive(Parser, Debug)]
@@ -30,9 +30,17 @@ struct Opt {
           value_name = "DELAY_MS", value_parser = clap::value_parser!(u32).range((MIN_LATENCY as i64)..=(MAX_LATENCY as i64)))]
     latency: Option<u32>,
 
+    /// Specify the password
+    #[arg(long, value_name = "PASSWORD")]
+    password: Option<String>,
+
     /// Specify the volume [0, 100]
     #[arg(short, long, value_name = "VOLUME", value_parser = clap::value_parser!(u32).range(0..=100))]
     volume: Option<u32>,
+
+    /// The device to capture audio from
+    #[arg(short, long, value_name = "DEVICE_NAME")]
+    device_name: Option<String>,
 
     /// Use the default device to play music
     #[cfg(not(target_os = "android"))]
@@ -132,6 +140,16 @@ async fn cli() -> Result<()> {
 
     let mut history_file = HistoryFile::new(&app_config_dir.join("history.json"), Some(10), true)?;
 
+    let password = opt
+        .password
+        .or_else(|| {
+            Password::with_theme(&input_theme)
+                .with_prompt("Enter the password")
+                .interact()
+                .ok()
+        })
+        .context("Error setting password")?;
+
     let server_address = if let Some(server) = opt.server {
         parse_server_name(&server).ok_or(anyhow!("This is not a valid address"))?
     } else {
@@ -200,18 +218,32 @@ async fn cli() -> Result<()> {
             .interact_text()? as u32
     };
 
-    let device_name = {
+    let mut device_names = ClientController::get_device_names();
+    device_names.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+    let device_history = history_file.get("device_name");
+    let device_name_opt = if let Some(device_name) = opt.device_name {
+        let device_found = device_names.iter().find(|&d| d == &device_name);
+        if let Some(device_name) = device_found {
+            Some(device_name.clone())
+        } else {
+            return Err(anyhow!("Could not find a device with name {device_name}"));
+        }
+    } else {
         #[cfg(not(target_os = "android"))]
         if !opt.default_device {
-            let devices_names = ClientController::get_device_names();
+            if let Some(last_device) = device_history.get_last() {
+                if let Some(index) = device_names.iter().position(|d| d == &last_device) {
+                    device_names.swap(0, index);
+                }
+            }
 
             let selection = FuzzySelect::with_theme(&input_theme)
                 .with_prompt("Select the output device")
                 .default(0)
-                .items(&devices_names)
+                .items(&device_names)
                 .interact()?;
 
-            Some(devices_names[selection].clone())
+            Some(device_names[selection].clone())
         } else {
             None
         }
@@ -219,17 +251,20 @@ async fn cli() -> Result<()> {
         #[cfg(target_os = "android")]
         None
     };
+    drop(device_names);
+
+    if let Some(device_name) = device_name_opt {
+        device_history.add(device_name.clone());
+        controller.set_device(device_name);
+    }
 
     drop(history_file);
     eprintln!();
 
     controller.set_latency(latency);
     controller.set_volume(volume);
-    if let Some(device_name) = device_name {
-        controller.set_device_name(device_name);
-    }
 
-    controller.start(server_address).await?;
+    controller.start(server_address, password).await?;
 
     #[cfg(not(target_os = "windows"))]
     tokio::select! {

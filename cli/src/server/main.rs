@@ -3,9 +3,10 @@ use std::process::ExitCode;
 use anyhow::{Ok, Result, anyhow};
 use clap::{ArgAction, Parser, ValueEnum};
 use dialoguer::{FuzzySelect, theme::ColorfulTheme};
-use log::error;
+use log::{error, info};
 use oabs_cli::history::HistoryFile;
 use oabs_lib::{common::constants::DEFAULT_PORT, server::ServerController};
+use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use strum::{EnumIter, EnumString, IntoEnumIterator, IntoStaticStr};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
@@ -50,6 +51,9 @@ struct Opt {
     #[arg(short, long, value_name = "MAX_CLIENTS", default_value_t = 5)]
     max_connections: u16,
 
+    #[arg(long, value_name = "PASSWORD")]
+    password: Option<String>,
+
     /// The device to capture audio from
     #[arg(short, long, value_name = "DEVICE_NAME")]
     device_name: Option<String>,
@@ -61,6 +65,54 @@ struct Opt {
     /// The device to capture audio from
     #[arg(short, long, action = ArgAction::SetTrue)]
     list_devices: bool,
+}
+
+pub fn generate_random_password(len: usize, num_digits: usize, num_symbols: usize) -> String {
+    assert!(
+        num_digits + num_symbols <= len,
+        "Too many required characters"
+    );
+
+    // Build character sets
+    let digits: Vec<char> = (b'0'..=b'9').map(|c| c as char).collect();
+    let uppercase: Vec<char> = (b'A'..=b'Z').map(|c| c as char).collect();
+    let lowercase: Vec<char> = (b'a'..=b'z').map(|c| c as char).collect();
+    let symbols: Vec<char> = (b'!'..=b'/')
+        .chain(b':'..=b'@')
+        .chain(b'['..=b'`')
+        .chain(b'{'..=b'~')
+        .map(|c| c as char)
+        .collect();
+
+    // Full charset = all categories
+    let mut charset = Vec::new();
+    charset.extend(&digits);
+    charset.extend(&uppercase);
+    charset.extend(&lowercase);
+    charset.extend(&symbols);
+
+    let mut rng = rand::thread_rng();
+    let mut password: Vec<char> = Vec::with_capacity(len);
+
+    // Ensure required digits
+    for _ in 0..num_digits {
+        password.push(*digits.choose(&mut rng).unwrap());
+    }
+
+    // Ensure required symbols
+    for _ in 0..num_symbols {
+        password.push(*symbols.choose(&mut rng).unwrap());
+    }
+
+    // Fill the rest with random characters from the full set
+    while password.len() < len {
+        password.push(*charset.choose(&mut rng).unwrap());
+    }
+
+    // Shuffle so required characters aren’t always at the front
+    password.shuffle(&mut rng);
+
+    password.into_iter().collect()
 }
 
 async fn main_wrapper() -> Result<()> {
@@ -170,6 +222,7 @@ async fn main_wrapper() -> Result<()> {
         #[cfg(target_os = "android")]
         None
     };
+    drop(device_names);
 
     if let Some(device_name) = device_name_opt {
         device_history.add(device_name.clone());
@@ -226,7 +279,17 @@ async fn main_wrapper() -> Result<()> {
         eprintln!();
     }
 
-    controller.start(DEFAULT_PORT, quality_value).await?;
+    let password = if let Some(password) = opt.password {
+        password
+    } else {
+        let password = generate_random_password(15, 4, 3);
+        info!("Server password: {}", password);
+        password
+    };
+
+    controller
+        .start(DEFAULT_PORT, quality_value, password)
+        .await?;
 
     Ok(())
 }

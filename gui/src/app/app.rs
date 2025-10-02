@@ -3,7 +3,7 @@ use leptos::*;
 use logging::log;
 use oabs_client_ui_lib::{
     platform::Platform,
-    tauri_api::dialog::{self, confirm, message, ConfirmDialogOptions, MessageDialogOptions},
+    tauri_api::dialog::{self, ConfirmDialogOptions, MessageDialogOptions, confirm, message},
 };
 use serde::{Deserialize, Serialize};
 use serde_wasm_bindgen::{from_value, to_value};
@@ -38,6 +38,7 @@ extern "C" {
 #[serde(rename_all = "camelCase")]
 struct StartServerArgs {
     server_name: String,
+    password: String,
     latency: u32,
     volume: u32,
     device_name: Option<String>,
@@ -73,6 +74,7 @@ pub fn App() -> impl IntoView {
     const STEP_LATENCY: i32 = 10;
 
     let (server_name, set_server_name) = create_signal(String::new());
+    let (server_password, set_server_password) = create_signal(String::new());
     let (volume, set_volume) = create_signal(DEFAULT_VOLUME);
     let (latency, set_latency) = create_signal(DEFAULT_LATENCY);
     let (selected_device_name, set_selected_device_name) = create_signal(String::new());
@@ -99,7 +101,8 @@ pub fn App() -> impl IntoView {
 
     spawn_local(async move {
         if let Ok(js_value) = invoke("get_devices", JsValue::null()).await {
-            if let Ok(devices) = from_value::<Vec<String>>(js_value) {
+            if let Ok(mut devices) = from_value::<Vec<String>>(js_value) {
+                devices.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
                 set_device_names.set(devices);
             }
         }
@@ -193,7 +196,8 @@ pub fn App() -> impl IntoView {
                 }
             }
 
-            let server_name = server_name.get_untracked();
+            let name = server_name.get_untracked();
+            let password = server_password.get_untracked();
             let selected_device_name = if Platform::is_mobile() {
                 None
             } else {
@@ -203,7 +207,8 @@ pub fn App() -> impl IntoView {
             let latency = latency.get_untracked();
 
             let args = to_value(&StartServerArgs {
-                server_name: server_name,
+                server_name: name,
+                password: password,
                 latency: latency as u32,
                 volume: volume as u32,
                 device_name: selected_device_name,
@@ -258,7 +263,7 @@ pub fn App() -> impl IntoView {
             </Show>
             <div>
                 <label
-                    for="server-name"
+                    for="server-hostname"
                     class="block mb-2 text-sm font-medium text-gray-900 dark:text-white"
                 >
                     Server name
@@ -266,15 +271,39 @@ pub fn App() -> impl IntoView {
                 <div class="mt-2">
                     <input
                         type="text"
-                        name="server-name"
-                        id="server-name"
+                        name="server-hostname"
+                        id="server-hostname"
                         autocomplete="off"
                         autocapitalize="off"
-                        placeholder="Enter a name..."
+                        placeholder="Enter the server host name..."
                         class="bg-gray-50 border border-gray-300 text-gray-900 disabled:text-gray-500 text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5 dark:bg-gray-700 dark:border-gray-600 dark:placeholder-gray-400 dark:text-white disabled:dark:text-gray-400 dark:focus:ring-blue-500 dark:focus:border-blue-500"
                         value=move || server_name.get()
                         on:input=move |ev| {
                             set_server_name.set(event_target_value(&ev));
+                        }
+                        disabled=move || playing_status.get() != PlayingStatus::STOPPED
+                    />
+                </div>
+            </div>
+            <div class="mt-4">
+                <label
+                    for="server-password"
+                    class="block mb-2 text-sm font-medium text-gray-900 dark:text-white"
+                >
+                    Server password
+                </label>
+                <div class="mt-2">
+                    <input
+                        type="password"
+                        name="server-password"
+                        id="server-password"
+                        autocomplete="off"
+                        autocapitalize="off"
+                        placeholder="Enter the server password..."
+                        class="bg-gray-50 border border-gray-300 text-gray-900 disabled:text-gray-500 text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5 dark:bg-gray-700 dark:border-gray-600 dark:placeholder-gray-400 dark:text-white disabled:dark:text-gray-400 dark:focus:ring-blue-500 dark:focus:border-blue-500"
+                        value=move || server_password.get()
+                        on:input=move |ev| {
+                            set_server_password.set(event_target_value(&ev));
                         }
                         disabled=move || playing_status.get() != PlayingStatus::STOPPED
                     />

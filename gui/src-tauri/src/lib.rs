@@ -74,6 +74,7 @@ async fn start_server(
     app_handle: AppHandle,
     data: State<'_, ClientData>,
     server_name: String,
+    password: String,
     latency: u32,
     volume: u32,
     device_name: Option<String>,
@@ -101,11 +102,11 @@ async fn start_server(
     controller.set_latency(latency);
     controller.set_volume(volume);
     if let Some(device_name) = device_name {
-        controller.set_device_name(device_name);
+        controller.set_device(device_name);
     }
 
     controller
-        .start(server_address)
+        .start(server_address, password)
         .await
         .map_err(|e| format!("{e}"))?;
 

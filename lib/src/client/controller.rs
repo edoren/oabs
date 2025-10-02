@@ -1,13 +1,16 @@
-use std::{mem::MaybeUninit, net::SocketAddr, time::Duration};
+use std::{mem::MaybeUninit, net::SocketAddr, ops::Deref, time::Duration};
 
 use anyhow::{Result, anyhow};
 use aotuv_lancer_vorbis_sys::*;
+use argon2::Argon2;
+use chacha20poly1305::{AeadCore, KeyInit, XChaCha20Poly1305, aead::Aead};
 use cpal::{
     Device, SupportedStreamConfig,
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
-use log::{debug, error, info, trace};
+use log::{debug, error, trace};
 use ogg_next_sys::*;
+use rand::rngs::OsRng;
 use ringbuf::{
     HeapRb,
     traits::{Consumer, Producer, Split},
@@ -15,10 +18,7 @@ use ringbuf::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpStream, UdpSocket},
-    sync::{
-        self,
-        mpsc::{self},
-    },
+    sync::{self},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -62,12 +62,12 @@ unsafe fn decode_first_package(
     vb: &mut Box<MaybeUninit<vorbis_block>>,
 ) -> Result<()> {
     unsafe {
+        debug!("Header size: {}", packet.len());
+
         let buffer_ptr = ogg_sync_buffer(oy.as_mut_ptr(), packet.len().try_into()?).cast::<u8>();
         let decode_buffer = std::slice::from_raw_parts_mut(buffer_ptr, packet.len());
         decode_buffer[..packet.len()].copy_from_slice(packet);
         ogg_sync_wrote(oy.as_mut_ptr(), packet.len().try_into()?);
-
-        debug!("Header size: {}", packet.len());
 
         /* Get the first page. */
         if ogg_sync_pageout(oy.as_mut_ptr(), og.as_mut_ptr()) != 1 {
@@ -316,7 +316,7 @@ impl ClientController {
             .collect()
     }
 
-    pub fn set_device_name(&mut self, device_name: String) {
+    pub fn set_device(&mut self, device_name: String) {
         self.selected_device = Self::get_devices()
             .into_iter()
             .find(|d| d.name().is_ok_and(|d_name| d_name == device_name));
@@ -332,8 +332,10 @@ impl ClientController {
 
     fn create_decode_task(
         &self,
-        mut encoded_rx: mpsc::Receiver<(StreamStatus, Vec<u8>)>,
+        encrypt_key: [u8; 32],
+        mut encoded_rx: sync::mpsc::Receiver<(StreamStatus, Vec<u8>)>,
         mut producer: <HeapRb<f32> as ringbuf::traits::Split>::Prod,
+        cancellation_token: CancellationToken,
     ) -> std::thread::JoinHandle<Result<()>> {
         std::thread::spawn(move || {
             debug!("Starting decode task");
@@ -354,11 +356,28 @@ impl ClientController {
                 ogg_sync_init(oy.as_mut_ptr());
             };
 
+            let cancellation_token = cancellation_token;
+
             'decode_loop: loop {
                 let (stream_status, data) = match encoded_rx.blocking_recv() {
                     Some(val) => val,
                     None => continue,
                 };
+
+                if cancellation_token.is_cancelled() {
+                    break;
+                }
+
+                let cipher = XChaCha20Poly1305::new(encrypt_key.as_slice().into());
+                let nonce = data[data.len() - 24..]
+                    .iter()
+                    .map(|v| v ^ 0x7)
+                    .collect::<Vec<u8>>();
+                let ciphertext = &data[..data.len() - 24];
+
+                let data = cipher
+                    .decrypt(nonce.deref().into(), ciphertext)
+                    .map_err(|e| anyhow!("{e}"))?;
 
                 match stream_status {
                     StreamStatus::Starting => unsafe {
@@ -405,7 +424,7 @@ impl ClientController {
     async fn stream_receiver_task(
         client_id: String,
         server_address: SocketAddr,
-        encoded_tx: mpsc::Sender<(StreamStatus, Vec<u8>)>,
+        encoded_tx: sync::mpsc::Sender<(StreamStatus, Vec<u8>)>,
         child_token: CancellationToken,
     ) -> Result<()> {
         debug!("Starting stream receiver task");
@@ -470,7 +489,7 @@ impl ClientController {
     fn create_stream_receiver_task(
         client_id: String,
         server_address: SocketAddr,
-        encoded_tx: mpsc::Sender<(StreamStatus, Vec<u8>)>,
+        encoded_tx: sync::mpsc::Sender<(StreamStatus, Vec<u8>)>,
         child_token: CancellationToken,
     ) -> tokio::task::JoinHandle<Result<()>> {
         tokio::spawn(async move {
@@ -486,7 +505,6 @@ impl ClientController {
 
         let mut close_requested = false;
 
-        let child_token = cancellation_token.child_token();
         loop {
             let data = tokio::select! {
                 result = recv_data(&mut tcp_stream) => {
@@ -498,7 +516,7 @@ impl ClientController {
                         },
                     }
                 },
-                _ = child_token.cancelled() => {
+                _ = cancellation_token.cancelled() => {
                     close_requested = true;
                     vec![]
                 }
@@ -597,7 +615,7 @@ impl ClientController {
         })
     }
 
-    pub async fn start(&mut self, server_address: SocketAddr) -> Result<()> {
+    pub async fn start(&mut self, server_address: SocketAddr, password: String) -> Result<()> {
         let cancellation_token = CancellationToken::new();
 
         let device = self
@@ -607,13 +625,49 @@ impl ClientController {
 
         let mut tcp_stream = TcpStream::connect(server_address).await?;
 
-        info!("Connected to server {}", server_address);
+        debug!("Connected to server {}", server_address);
 
         // Wait for the socket to be readable
         tcp_stream.readable().await?;
 
         // Creating the buffer **after** the `await` prevents it from
         // being stored in the async task.
+
+        let (salt, verifier) = loop {
+            match recv_data(&mut tcp_stream).await {
+                Ok(data) => {
+                    let value: OABSMessage = serde_json::from_slice(&data)?;
+                    if let OABSMessage::AuthenticateRequest { salt, verifier } = value {
+                        break (salt, verifier);
+                    }
+                    return Err(anyhow!("Didn't get authenticate request"));
+                }
+                Err(e) => {
+                    return Err(anyhow!("Failed to receive data: {e}"));
+                }
+            }
+        };
+
+        let mut encrypt_key = [0u8; 32];
+        Argon2::default()
+            .hash_password_into(&password.into_bytes(), salt.as_bytes(), &mut encrypt_key)
+            .map_err(|e| anyhow!("Could not hash password: {e}"))?;
+
+        let cipher = XChaCha20Poly1305::new((&encrypt_key).into());
+        let nonce: chacha20poly1305::aead::generic_array::GenericArray<u8, _> =
+            XChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let mut verifier_encrypted = cipher
+            .encrypt(&nonce, verifier.deref())
+            .map_err(|e| anyhow!("{e}"))?;
+        verifier_encrypted
+            .extend_from_slice(nonce.iter().map(|v| v ^ 0x5).collect::<Vec<u8>>().deref());
+
+        let auth_msg = serde_json::to_vec(&OABSMessage::Authenticate {
+            verifier: verifier_encrypted,
+        })?;
+
+        send_data(&mut tcp_stream, auth_msg.as_slice()).await?;
+
         let client_id: String = loop {
             match recv_data(&mut tcp_stream).await {
                 Ok(data) => {
@@ -623,8 +677,11 @@ impl ClientController {
                     }
                     return Err(anyhow!("Client id not found"));
                 }
-                Err(e) => {
-                    return Err(e.into());
+                Err(_e) => {
+                    // TODO: Add delay
+                    return Err(anyhow!(
+                        "Could not authenticate, please check your password"
+                    ));
                 }
             }
         };
@@ -651,7 +708,7 @@ impl ClientController {
             (*self.latency.1.borrow() as f32 / 1_000.0) * config.sample_rate().0 as f32;
         let latency_samples = latency_frames as usize * config.channels() as usize;
 
-        let (encoded_tx, encoded_rx) = mpsc::channel::<(StreamStatus, Vec<u8>)>(20);
+        let (encoded_tx, encoded_rx) = sync::mpsc::channel::<(StreamStatus, Vec<u8>)>(20);
 
         // The buffer to share samples
         let (mut producer, consumer) = HeapRb::<f32>::new(latency_samples).split();
@@ -667,8 +724,12 @@ impl ClientController {
                 .map_err(|e| anyhow!("Could not fill buffer: {e}"))?;
         }
 
-        self.decode_joinh
-            .replace(self.create_decode_task(encoded_rx, producer));
+        self.decode_joinh.replace(self.create_decode_task(
+            encrypt_key,
+            encoded_rx,
+            producer,
+            cancellation_token.child_token(),
+        ));
         self.player_joinh.replace(self.create_playback_task(
             config,
             device.clone(),
@@ -722,7 +783,7 @@ impl ClientController {
             cancellation_token.cancel();
             self.wait().await?;
         }
-        info!("Client closed successfully");
+        debug!("Client closed successfully");
         Ok(())
     }
 
