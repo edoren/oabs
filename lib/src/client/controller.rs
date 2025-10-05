@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, ops::Deref, time::Duration};
+use std::{net::SocketAddr, ops::Deref};
 
 use anyhow::{Result, anyhow};
 use argon2::Argon2;
@@ -115,73 +115,61 @@ impl ClientController {
         mut producer: <HeapRb<f32> as ringbuf::traits::Split>::Prod,
         cancellation_token: CancellationToken,
     ) -> Result<()> {
-        let handle = std::thread::spawn(move || -> Result<()> {
-            debug!("Starting decode task");
+        debug!("Starting decode task");
 
-            let mut decoder = VorbisDecoder::new();
+        let mut decoder = VorbisDecoder::new();
 
-            let cancellation_token = cancellation_token;
+        let cancellation_token = cancellation_token;
 
-            'decode_loop: loop {
-                let (stream_status, data) = match encoded_rx.blocking_recv() {
-                    Some(val) => val,
-                    None => continue,
-                };
+        'decode_loop: loop {
+            let (stream_status, data) = match encoded_rx.recv().await {
+                Some(val) => val,
+                None => continue,
+            };
 
-                if cancellation_token.is_cancelled() {
-                    break;
-                }
-
-                let cipher = XChaCha20Poly1305::new(encrypt_key.as_slice().into());
-                let nonce = data[data.len() - 24..]
-                    .iter()
-                    .map(|v| v ^ 0x7)
-                    .collect::<Vec<u8>>();
-                let ciphertext = &data[..data.len() - 24];
-
-                let data = cipher
-                    .decrypt(nonce.deref().into(), ciphertext)
-                    .map_err(|e| anyhow!("{e}"))?;
-
-                match stream_status {
-                    StreamStatus::Starting => {
-                        let _ = decoder
-                            .decode_first_package(&data)
-                            .inspect_err(|e| error!("Error while decoding first  {e}"));
-                    }
-                    StreamStatus::Streaming => {
-                        let _ = decoder
-                            .decode_next_package(&data, |stream| {
-                                producer.push_slice(&stream);
-                            })
-                            .inspect_err(|e| error!("Error while decoding {e}"));
-                    }
-                    StreamStatus::Stopped => {
-                        break 'decode_loop;
-                    }
-                };
+            if cancellation_token.is_cancelled() {
+                break;
             }
 
-            debug!("Stopping decode task");
-            Ok(())
-        });
+            let cipher = XChaCha20Poly1305::new(encrypt_key.as_slice().into());
+            let nonce = data[data.len() - 24..]
+                .iter()
+                .map(|v| v ^ 0x7)
+                .collect::<Vec<u8>>();
+            let ciphertext = &data[..data.len() - 24];
 
-        tokio::task::spawn_blocking(move || {
-            handle
-                .join()
-                .map_err(|e| anyhow!("Error joining decode task {e:?}"))
-        })
-        .await
-        .map_err(|e| anyhow!("Error joining tokio decode task {e}"))
-        .flatten()
-        .flatten()
+            let data = cipher
+                .decrypt(nonce.deref().into(), ciphertext)
+                .map_err(|e| anyhow!("{e}"))?;
+
+            match stream_status {
+                StreamStatus::Starting => {
+                    let _ = decoder
+                        .decode_first_package(&data)
+                        .inspect_err(|e| error!("Error while decoding first  {e}"));
+                }
+                StreamStatus::Streaming => {
+                    let _ = decoder
+                        .decode_next_package(&data, |stream| {
+                            producer.push_slice(&stream);
+                        })
+                        .inspect_err(|e| error!("Error while decoding {e}"));
+                }
+                StreamStatus::Stopped => {
+                    break 'decode_loop;
+                }
+            };
+        }
+
+        debug!("Stopping decode task");
+        Ok(())
     }
 
     async fn stream_receiver_task(
         client_id: String,
         server_address: SocketAddr,
         encoded_tx: sync::mpsc::Sender<(StreamStatus, Vec<u8>)>,
-        child_token: CancellationToken,
+        cancellation_token: CancellationToken,
     ) -> Result<()> {
         debug!("Starting stream receiver task");
 
@@ -212,7 +200,7 @@ impl ClientController {
                         },
                     }
                 },
-                _ = child_token.cancelled() => {
+                _ = cancellation_token.cancelled() => {
                     stream_status = StreamStatus::Stopped;
                     0
                 }
@@ -308,55 +296,38 @@ impl ClientController {
         config: SupportedStreamConfig,
         device: Device,
         mut consumer: <HeapRb<f32> as ringbuf::traits::Split>::Cons,
-        child_token: CancellationToken,
+        cancellation_token: CancellationToken,
     ) -> Result<()> {
-        let handle = std::thread::spawn(move || -> Result<()> {
-            debug!("Starting playback task");
+        debug!("Starting playback task");
 
-            let err_fn = move |err| {
-                error!("An error occurred on stream: {}", err);
-            };
+        let err_fn = move |err| {
+            error!("An error occurred on stream: {}", err);
+        };
 
-            let playback_stream = device.build_output_stream(
-                &config.into(),
-                move |data: &mut [f32], _: &_| {
-                    let requested_count = data.len();
-                    let read_count = consumer.pop_slice(data);
-                    data.iter_mut()
-                        .for_each(|s| *s = *s * *volume.borrow() as f32 / 100.0);
-                    if read_count < requested_count {
-                        trace!("input stream fell behind: try increasing latency");
-                    }
-                },
-                err_fn,
-                None,
-            )?;
-
-            playback_stream.play()?;
-            loop {
-                if child_token.is_cancelled() {
-                    break;
+        let playback_stream = device.build_output_stream(
+            &config.into(),
+            move |data: &mut [f32], _: &_| {
+                let requested_count = data.len();
+                let read_count = consumer.pop_slice(data);
+                data.iter_mut()
+                    .for_each(|s| *s = *s * *volume.borrow() as f32 / 100.0);
+                if read_count < requested_count {
+                    trace!("input stream fell behind: try increasing latency");
                 }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            playback_stream.pause()?;
+            },
+            err_fn,
+            None,
+        )?;
 
-            drop(playback_stream);
+        playback_stream.play()?;
+        cancellation_token.cancelled().await;
+        playback_stream.pause()?;
 
-            debug!("Stopping playback task");
+        drop(playback_stream);
 
-            Ok(())
-        });
+        debug!("Stopping playback task");
 
-        tokio::task::spawn_blocking(move || {
-            handle
-                .join()
-                .map_err(|e| anyhow!("Error joining playback task {e:?}"))
-        })
-        .await
-        .map_err(|e| anyhow!("Error joining tokio playback task {e}"))
-        .flatten()
-        .flatten()
+        Ok(())
     }
 
     pub async fn start(&mut self, server_address: SocketAddr, password: String) -> Result<()> {
