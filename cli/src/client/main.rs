@@ -7,12 +7,11 @@ use anyhow::{Context, Result, anyhow};
 use clap::{ArgAction, Parser};
 use dialoguer::{FuzzySelect, Input, Password, theme::ColorfulTheme};
 use log::error;
-use oabs_cli::history::HistoryFile;
+use oabs_common::{history::HistoryFile, signal};
 use oabs_lib::{
     client::ClientController,
     common::constants::{DEFAULT_PORT, DEFAULT_SERVER_NAME, MAX_LATENCY, MIN_LATENCY},
 };
-use tokio::signal;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{
     EnvFilter, Layer, filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt,
@@ -266,28 +265,10 @@ async fn cli() -> Result<()> {
 
     controller.start(server_address, password).await?;
 
-    #[cfg(not(target_os = "windows"))]
     tokio::select! {
-        _ = signal::ctrl_c() => { },
         _ = controller.wait() => { },
-    };
-
-    #[cfg(target_os = "windows")]
-    {
-        let mut ctrl_c_signal = signal::windows::ctrl_c()?;
-        let mut ctrl_close_signal = signal::windows::ctrl_close()?;
-        let mut ctrl_break_signal = signal::windows::ctrl_break()?;
-        let mut ctrl_logoff_signal = signal::windows::ctrl_logoff()?;
-        let mut ctrl_shutdown_signal = signal::windows::ctrl_shutdown()?;
-        tokio::select! {
-            _ = ctrl_c_signal.recv() => { },
-            _ = ctrl_close_signal.recv() => { },
-            _ = ctrl_break_signal.recv() => { },
-            _ = ctrl_logoff_signal.recv() => { },
-            _ = ctrl_shutdown_signal.recv() => { },
-            _ = controller.wait() => { },
-        }
-    };
+        _ = signal::close() => { },
+    }
 
     controller.stop().await?;
 

@@ -5,6 +5,7 @@ use rupnp::{
     Device, Service,
     ssdp::{SearchTarget, URN},
 };
+use thiserror::Error;
 
 const WANIP_CONNECTION_VER_1: URN = URN::service("schemas-upnp-org", "WANIPConnection", 1);
 const WANIP_CONNECTION_VER_2: URN = URN::service("schemas-upnp-org", "WANIPConnection", 2);
@@ -41,26 +42,12 @@ pub struct DeletePortConfig {
     pub protocol: PortMappingProtocol,
 }
 
+#[derive(Error, Debug)]
 pub enum UPnPError {
-    DEFAULT,
-}
-
-impl std::fmt::Debug for UPnPError {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "UPnPError")
-    }
-}
-
-impl std::fmt::Display for UPnPError {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "UPnPError")
-    }
-}
-
-impl std::error::Error for UPnPError {
-    fn description(&self) -> &str {
-        "WOW"
-    }
+    #[error("upnp discovery timeout")]
+    Timeout,
+    #[error("default upnp error")]
+    Default,
 }
 
 pub struct UPnP {
@@ -72,13 +59,17 @@ impl UPnP {
         let mut devices = Vec::new();
         for schema in vec![WANIP_CONNECTION_VER_1, WANIP_CONNECTION_VER_2] {
             let search_target = SearchTarget::URN(schema.clone());
-            let mut found_devices = rupnp::discover(&search_target, Duration::from_secs(5))
+
+            let mut found_devices = rupnp::discover(&search_target, Duration::from_secs(3), None)
                 .await
-                .map_err(|_e| UPnPError::DEFAULT)?
+                .map_err(|_e| UPnPError::Timeout)?
                 .try_collect::<Vec<Device>>()
                 .await
-                .map_err(|_e| UPnPError::DEFAULT)?;
+                .map_err(|_e| UPnPError::Default)?;
             devices.append(&mut found_devices);
+        }
+        if devices.is_empty() {
+            return Err(UPnPError::Default);
         }
         return Ok(UPnP { devices });
     }
@@ -108,7 +99,10 @@ impl UPnP {
                     args += &arg;
                 }
 
-                let _ = service.action(device.url(), "AddPortMapping", &args).await;
+                service
+                    .action(device.url(), "AddPortMapping", &args)
+                    .await
+                    .map_err(|_e| UPnPError::Default)?;
             }
         }
 
@@ -151,12 +145,12 @@ impl UPnP {
             {
                 return Ok(response
                     .get("NewExternalIPAddress")
-                    .ok_or(UPnPError::DEFAULT)?
+                    .ok_or(UPnPError::Default)?
                     .to_string());
             }
         }
 
-        Err(UPnPError::DEFAULT)
+        Err(UPnPError::Default)
     }
 
     fn get_device_service<'a>(&'a self, device: &'a Device) -> Result<&'a Service, UPnPError> {
@@ -165,6 +159,6 @@ impl UPnP {
                 return Ok(service);
             }
         }
-        Err(UPnPError::DEFAULT)
+        Err(UPnPError::Default)
     }
 }

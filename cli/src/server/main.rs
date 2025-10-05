@@ -4,7 +4,7 @@ use anyhow::{Ok, Result, anyhow};
 use clap::{ArgAction, Parser, ValueEnum};
 use dialoguer::{FuzzySelect, theme::ColorfulTheme};
 use log::{error, info};
-use oabs_cli::history::HistoryFile;
+use oabs_common::{history::HistoryFile, signal};
 use oabs_lib::{common::constants::DEFAULT_PORT, server::ServerController};
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
@@ -290,6 +290,13 @@ async fn main_wrapper() -> Result<()> {
     controller
         .start(DEFAULT_PORT, quality_value, password)
         .await?;
+
+    tokio::select! {
+        _ = controller.wait() => { },
+        _ = signal::close() => { },
+    }
+
+    controller.stop().await?;
 
     Ok(())
 }

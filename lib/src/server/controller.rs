@@ -1,16 +1,13 @@
 use std::{
     collections::HashMap,
     io::{self, ErrorKind},
-    mem::MaybeUninit,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     ops::Deref,
-    slice,
     sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow};
-use aotuv_lancer_vorbis_sys::*;
 use argon2::{Argon2, password_hash::SaltString};
 use chacha20poly1305::{
     XChaCha20Poly1305,
@@ -21,14 +18,13 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
 use futures::TryFutureExt;
+// use futures::TryFutureExt;
 use local_ip_address::local_ip;
 use log::{debug, error, trace};
-use ogg_next_sys::*;
-use rand::{Rng, rngs::OsRng, thread_rng};
+use rand::{Rng, rngs::OsRng};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
-    signal,
     sync::mpsc,
     task::{JoinSet, yield_now},
     time::{Instant, sleep, sleep_until, timeout_at},
@@ -36,6 +32,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    audio::vorbis::VorbisEncoder,
     common::serializers::{OABSMessage, SupportedStreamConfigSerialize},
     server::upnp::{AddPortConfig, DeletePortConfig, PortMappingProtocol, UPnP},
 };
@@ -85,7 +82,8 @@ async fn client_handler(
 
     let auth_result = timeout_at(
         Instant::now() + Duration::from_secs(5),
-        recv_data(&mut stream).map_err(|e| anyhow!("Failed receiving auth payload {e}")),
+        recv_data(&mut stream)
+            .map_err(|e| anyhow!("Failed receiving authentication response: {e}")),
     )
     .await
     .map_err(|e| anyhow!("Failed authentication, client timeout: {e}"))
@@ -206,7 +204,7 @@ async fn client_handler(
     Ok(())
 }
 
-async fn payload_server(
+async fn payload_server_task(
     server_addr: SocketAddr,
     salt: String,
     encrypt_key: [u8; 32],
@@ -228,17 +226,14 @@ async fn payload_server(
                 break;
             }
         };
-        streams.spawn(
-            client_handler(
-                stream,
-                salt.clone(),
-                encrypt_key.clone(),
-                config.clone(),
-                client_status_tx.clone(),
-                cancellation_token.child_token(),
-            )
-            .inspect_err(|e| error!("Client error: {e}")),
-        );
+        streams.spawn(client_handler(
+            stream,
+            salt.clone(),
+            encrypt_key.clone(),
+            config.clone(),
+            client_status_tx.clone(),
+            cancellation_token.child_token(),
+        ));
     }
 
     while let Some(_res) = streams.join_next().await {}
@@ -247,7 +242,42 @@ async fn payload_server(
     Ok(())
 }
 
-async fn stream_server(
+async fn playback_capturer_task(
+    device: Device,
+    config: SupportedStreamConfig,
+    data_send_tx: mpsc::UnboundedSender<Vec<f32>>,
+    cancellation_token: CancellationToken,
+) -> Result<()> {
+    debug!("Playback capturer");
+
+    let stream = device.build_input_stream(
+        &config.into(),
+        move |data: &[f32], _| {
+            let mut samples = Vec::new();
+            samples.extend_from_slice(&data);
+            let res = data_send_tx.send(data.to_vec());
+            if let Err(e) = res {
+                error!("{e:?}");
+            }
+        },
+        move |err| {
+            error!("En error occurred on stream: {}", err);
+        },
+        None,
+    )?;
+
+    debug!("Begin recording");
+    stream.play()?;
+    cancellation_token.cancelled().await;
+    stream.pause()?;
+    debug!("Stopped recording");
+
+    drop(stream);
+
+    Ok(())
+}
+
+async fn stream_server_task(
     server_addr: SocketAddr,
     encrypt_key: [u8; 32],
     quality: f32,
@@ -263,78 +293,21 @@ async fn stream_server(
 
     let cipher = XChaCha20Poly1305::new((&encrypt_key).into());
 
-    let mut os: Box<MaybeUninit<ogg_stream_state>> = Box::new(MaybeUninit::uninit());
-    let mut og: Box<MaybeUninit<ogg_page>> = Box::new(MaybeUninit::uninit());
-    let mut op: Box<MaybeUninit<ogg_packet>> = Box::new(MaybeUninit::uninit());
+    let audio_channels = config.channels().into();
 
-    let mut vi: Box<MaybeUninit<vorbis_info>> = Box::new(MaybeUninit::uninit());
-    let mut vc: Box<MaybeUninit<vorbis_comment>> = Box::new(MaybeUninit::uninit());
-    let mut vd: Box<MaybeUninit<vorbis_dsp_state>> = Box::new(MaybeUninit::uninit());
-    let mut vb: Box<MaybeUninit<vorbis_block>> = Box::new(MaybeUninit::uninit());
+    let mut encoder = VorbisEncoder::new(
+        config.channels().into(),
+        config.sample_rate().0.try_into()?,
+        quality,
+    );
 
-    let serial_num;
-    let mut header_data: Vec<u8> = Vec::new();
+    let serial_num = encoder.get_serial_number();
+    let header_data = encoder.get_header_data();
 
-    unsafe {
-        vorbis_info_init(vi.as_mut_ptr());
-
-        let ret = vorbis_encode_init_vbr(
-            vi.as_mut_ptr(),
-            config.channels().into(),
-            config.sample_rate().0.try_into()?,
-            quality,
-        );
-        if ret != 0 {
-            panic!("vorbis_encode_init_vbr returned {ret}");
-        }
-
-        vorbis_comment_init(vc.as_mut_ptr());
-        // vorbis_comment_add_tag(vc.as_mut_ptr(), "ENCODER","encoder_example.c");
-
-        vorbis_analysis_init(vd.as_mut_ptr(), vi.as_mut_ptr());
-        vorbis_block_init(vd.as_mut_ptr(), vb.as_mut_ptr());
-
-        serial_num = thread_rng().r#gen();
-        debug!("Serial: {}", serial_num);
-        ogg_stream_init(os.as_mut_ptr(), serial_num);
-
-        {
-            let mut header = Box::new(MaybeUninit::uninit());
-            let mut header_comm = Box::new(MaybeUninit::uninit());
-            let mut header_code = Box::new(MaybeUninit::uninit());
-
-            vorbis_analysis_headerout(
-                vd.as_mut_ptr(),
-                vc.as_mut_ptr(),
-                header.as_mut_ptr(),
-                header_comm.as_mut_ptr(),
-                header_code.as_mut_ptr(),
-            );
-            ogg_stream_packetin(os.as_mut_ptr(), header.as_mut_ptr());
-            ogg_stream_packetin(os.as_mut_ptr(), header_comm.as_mut_ptr());
-            ogg_stream_packetin(os.as_mut_ptr(), header_code.as_mut_ptr());
-
-            /* This ensures the actual
-             * audio data will start on a new page, as per spec
-             */
-            while ogg_stream_flush(os.as_mut_ptr(), og.as_mut_ptr()) != 0 {
-                let ogg_page = og.assume_init_ref();
-                header_data.extend_from_slice(slice::from_raw_parts(
-                    ogg_page.header,
-                    ogg_page.header_len as usize,
-                ));
-                header_data.extend_from_slice(slice::from_raw_parts(
-                    ogg_page.body,
-                    ogg_page.body_len as usize,
-                ));
-            }
-        }
-    }
-
+    debug!("Serial: {serial_num}");
     debug!("Header size: {}", header_data.len());
 
     let mut buffer = [0; 256];
-    let mut encoded_data: Vec<u8> = Vec::new();
     let mut registered_clients: HashMap<String, Option<SocketAddr>> = HashMap::new();
 
     let mut client_detected = false;
@@ -396,11 +369,10 @@ async fn stream_server(
             yield_now().await;
         };
 
-        if registered_clients.is_empty() || !client_detected {
+        if raw_samples.len() % audio_channels != 0 {
+            error!("Invalid audio data length");
             continue;
         }
-
-        let audio_channels = unsafe { vi.assume_init_ref().channels as usize };
         let sample_count = raw_samples.len() / audio_channels;
 
         // Deinterlace the audio obtained from cpal
@@ -413,67 +385,10 @@ async fn stream_server(
             })
             .collect();
 
-        {
-            let encoder_buffer = unsafe {
-                slice::from_raw_parts_mut(
-                    vorbis_analysis_buffer(vd.as_mut_ptr(), sample_count.try_into()?),
-                    audio_channels,
-                )
-            };
+        let encoded_data = encoder.encode(audio_block)?;
 
-            for (channel_samples, channel_encode_buffer) in
-                audio_block.iter().zip(encoder_buffer.iter_mut())
-            {
-                let channel_samples: &Vec<f32> = channel_samples.as_ref();
-                if channel_samples.len() != sample_count {
-                    panic!("Invalid channel sample count");
-                }
-
-                unsafe {
-                    channel_samples
-                        .as_ptr()
-                        .copy_to_nonoverlapping(*channel_encode_buffer, sample_count);
-                }
-            }
-
-            let res = unsafe { vorbis_analysis_wrote(vd.as_mut_ptr(), sample_count.try_into()?) };
-            if res != 0 {
-                panic!("vorbis_analysis_wrote returned {res}");
-            }
-
-            // SAFETY: we assume the functions inside this unsafe block follow their
-            // documented contract
-            unsafe {
-                while vorbis_analysis_blockout(vd.as_mut_ptr(), vb.as_mut_ptr()) == 1 {
-                    let res = vorbis_analysis(vb.as_mut_ptr(), std::ptr::null_mut());
-                    if res != 0 {
-                        panic!("vorbis_analysis returned {res}");
-                    }
-                    let res = vorbis_bitrate_addblock(vb.as_mut_ptr());
-                    if res != 0 {
-                        panic!("vorbis_bitrate_addblock returned {res}");
-                    }
-
-                    while vorbis_bitrate_flushpacket(vd.as_mut_ptr(), op.as_mut_ptr()) == 1 {
-                        let res = ogg_stream_packetin(os.as_mut_ptr(), op.as_mut_ptr());
-                        if res != 0 {
-                            panic!("ogg_stream_packetin returned {res}");
-                        }
-
-                        while ogg_stream_flush(os.as_mut_ptr(), og.as_mut_ptr()) != 0 {
-                            let ogg_page = og.assume_init_ref();
-                            encoded_data.extend_from_slice(slice::from_raw_parts(
-                                ogg_page.header,
-                                ogg_page.header_len as usize,
-                            ));
-                            encoded_data.extend_from_slice(slice::from_raw_parts(
-                                ogg_page.body,
-                                ogg_page.body_len as usize,
-                            ));
-                        }
-                    }
-                }
-            }
+        if registered_clients.is_empty() || !client_detected {
+            continue;
         }
 
         if encoded_data.is_empty() {
@@ -493,24 +408,14 @@ async fn stream_server(
             }
         }
 
-        encoded_data.clear();
-
         yield_now().await;
-    }
-
-    unsafe {
-        ogg_stream_clear(os.as_mut_ptr());
-        vorbis_block_clear(vb.as_mut_ptr());
-        vorbis_dsp_clear(vd.as_mut_ptr());
-        vorbis_comment_clear(vc.as_mut_ptr());
-        vorbis_info_clear(vi.as_mut_ptr());
     }
 
     debug!("Stopping stream server");
     Ok(())
 }
 
-async fn upnp_connector(port: u16, cancellation_token: CancellationToken) -> Result<()> {
+async fn upnp_connector_task(port: u16, cancellation_token: CancellationToken) -> Result<()> {
     debug!("Starting UPnP task");
 
     let local_ipv4 = match local_ip() {
@@ -540,7 +445,7 @@ async fn upnp_connector(port: u16, cancellation_token: CancellationToken) -> Res
     let upnp = match UPnP::new().await {
         Ok(devices) => devices,
         Err(_e) => {
-            debug!("Error setting UPnP port");
+            debug!("UPnP not supported");
             return Ok(());
         }
     };
@@ -576,12 +481,15 @@ async fn upnp_connector(port: u16, cancellation_token: CancellationToken) -> Res
     let _ = upnp.delete_port(&delete_mapping).await;
 
     debug!("Stopping UPnP task");
-    Ok::<(), anyhow::Error>(())
+    Ok(())
 }
 
 pub struct ServerController {
     should_include_output_devices: bool,
     selected_device: Option<Device>,
+
+    cancellation_token: Option<CancellationToken>,
+    tasks: JoinSet<Result<()>>,
 }
 
 impl ServerController {
@@ -589,6 +497,9 @@ impl ServerController {
         Self {
             should_include_output_devices: false,
             selected_device: cpal::default_host().default_input_device(),
+
+            cancellation_token: None,
+            tasks: JoinSet::new(),
         }
     }
 
@@ -634,10 +545,20 @@ impl ServerController {
             .find(|d| d.name().is_ok_and(|d_name| d_name == device_name));
     }
 
-    pub async fn start(&self, port: u16, quality: f32, password: String) -> Result<()> {
+    pub async fn start(&mut self, port: u16, quality: f32, password: String) -> Result<()> {
+        if self.cancellation_token.is_some() {
+            return Err(anyhow!("Server already running"));
+        };
+
+        let cancellation_token = {
+            let token = CancellationToken::new();
+            self.cancellation_token = Some(token.clone());
+            token
+        };
+
         let device = self
             .selected_device
-            .as_ref()
+            .take()
             .ok_or(anyhow!("Could not find default input device"))?;
 
         let server_addr = SocketAddr::new(Ipv4Addr::new(0, 0, 0, 0).into(), port);
@@ -658,69 +579,10 @@ impl ServerController {
 
         // Run the input stream on a separate thread.
 
-        let cancellation_token = CancellationToken::new();
         let (data_send_tx, data_send_rx) = mpsc::unbounded_channel::<Vec<_>>();
         let (client_status_tx, client_status_rx) = mpsc::channel::<ClientStatus>(100);
 
         debug!("Sample Format {:?}", config.sample_format());
-
-        let config_clone = config.clone();
-        let cancellation_token_child = cancellation_token.child_token();
-        let playback_capturer_task = async move {
-            let stream = device.build_input_stream(
-                &config_clone.into(),
-                move |data: &[f32], _| {
-                    let mut samples = Vec::new();
-                    samples.extend_from_slice(&data);
-                    let res = data_send_tx.send(data.to_vec());
-                    if let Err(e) = res {
-                        error!("{e:?}");
-                    }
-                },
-                move |err| {
-                    error!("En error occurred on stream: {}", err);
-                },
-                None,
-            )?;
-
-            debug!("Begin recording");
-            stream.play()?;
-            cancellation_token_child.cancelled().await;
-            stream.pause()?;
-            debug!("Stopped recording");
-
-            drop(stream);
-
-            Ok::<(), anyhow::Error>(())
-        };
-
-        #[cfg(not(target_os = "windows"))]
-        let close_task = async move {
-            signal::ctrl_c().await?;
-            close_tx.send(true)?;
-            close_tx.closed().await;
-            return Ok::<(), anyhow::Error>(());
-        };
-
-        #[cfg(target_os = "windows")]
-        let cancellation_token_clone = cancellation_token.clone();
-        let close_task = async move {
-            let mut ctrl_c_signal = signal::windows::ctrl_c()?;
-            let mut ctrl_close_signal = signal::windows::ctrl_close()?;
-            let mut ctrl_break_signal = signal::windows::ctrl_break()?;
-            let mut ctrl_logoff_signal = signal::windows::ctrl_logoff()?;
-            let mut ctrl_shutdown_signal = signal::windows::ctrl_shutdown()?;
-            tokio::select! {
-                _ = ctrl_c_signal.recv() => { },
-                _ = ctrl_close_signal.recv() => { },
-                _ = ctrl_break_signal.recv() => { },
-                _ = ctrl_logoff_signal.recv() => { },
-                _ = ctrl_shutdown_signal.recv() => { },
-            }
-            cancellation_token_clone.cancel();
-            cancellation_token_clone.cancelled().await;
-            return Ok::<(), anyhow::Error>(());
-        };
 
         let (encrypt_key, salt) = {
             let salt = SaltString::generate(&mut OsRng).to_string();
@@ -733,7 +595,13 @@ impl ServerController {
             (encrypt_key, salt)
         };
 
-        let stream_server_task = stream_server(
+        self.tasks.spawn(playback_capturer_task(
+            device,
+            config.clone(),
+            data_send_tx,
+            cancellation_token.child_token(),
+        ));
+        self.tasks.spawn(stream_server_task(
             server_addr,
             encrypt_key,
             quality,
@@ -741,9 +609,8 @@ impl ServerController {
             data_send_rx,
             client_status_rx,
             cancellation_token.child_token(),
-        );
-
-        let payload_joinh = tokio::spawn(payload_server(
+        ));
+        self.tasks.spawn(payload_server_task(
             server_addr,
             salt,
             encrypt_key,
@@ -751,39 +618,40 @@ impl ServerController {
             client_status_tx,
             cancellation_token.child_token(),
         ));
-        let upnp_joinh = tokio::spawn(upnp_connector(
+        self.tasks.spawn(upnp_connector_task(
             server_addr.port(),
             cancellation_token.child_token(),
         ));
-        let close_joinh = tokio::spawn(close_task);
-
-        drop(cancellation_token);
-
-        let (payload_res, upnp_res, close_res, playback_capturer_res, stream_res) = tokio::join!(
-            payload_joinh,
-            upnp_joinh,
-            close_joinh,
-            playback_capturer_task,
-            stream_server_task
-        );
-        if let Err(e) = stream_res {
-            error!("{e:?}");
-        }
-        if let Err(e) = playback_capturer_res {
-            error!("{e:?}");
-        }
-        if let Err(e) = payload_res {
-            error!("{e:?}");
-        }
-        if let Err(e) = upnp_res {
-            error!("{e:?}");
-        }
-        if let Err(e) = close_res {
-            error!("{e:?}");
-        }
 
         debug!("Server closed successfully");
 
         Ok(())
+    }
+
+    pub async fn wait(&mut self) -> Result<()> {
+        while let Some(result) = self.tasks.join_next().await {
+            let internal_result = result.map_err(|e| anyhow!("Error joining {e}")).flatten();
+            if let Err(e) = internal_result {
+                error!("{e}");
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn stop(&mut self) -> Result<()> {
+        if let Some(cancellation_token) = self.cancellation_token.take() {
+            cancellation_token.cancel();
+            self.wait().await?;
+            debug!("Server closed successfully");
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ServerController {
+    fn drop(&mut self) {
+        if let Some(cancellation_token) = self.cancellation_token.take() {
+            cancellation_token.cancel();
+        }
     }
 }

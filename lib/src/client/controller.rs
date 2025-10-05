@@ -1,7 +1,6 @@
-use std::{mem::MaybeUninit, net::SocketAddr, ops::Deref, time::Duration};
+use std::{net::SocketAddr, ops::Deref, time::Duration};
 
 use anyhow::{Result, anyhow};
-use aotuv_lancer_vorbis_sys::*;
 use argon2::Argon2;
 use chacha20poly1305::{AeadCore, KeyInit, XChaCha20Poly1305, aead::Aead};
 use cpal::{
@@ -9,7 +8,6 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
 use log::{debug, error, trace};
-use ogg_next_sys::*;
 use rand::rngs::OsRng;
 use ringbuf::{
     HeapRb,
@@ -19,12 +17,16 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpStream, UdpSocket},
     sync::{self},
+    task::JoinSet,
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::common::{
-    constants::{DEFAULT_LATENCY, DEFAULT_VOLUME},
-    serializers::{OABSMessage, SupportedStreamConfigDeserialize},
+use crate::{
+    audio::vorbis::VorbisDecoder,
+    common::{
+        constants::{DEFAULT_LATENCY, DEFAULT_VOLUME},
+        serializers::{OABSMessage, SupportedStreamConfigDeserialize},
+    },
 };
 
 #[derive(Clone)]
@@ -47,223 +49,6 @@ async fn recv_data(stream: &mut TcpStream) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-unsafe fn decode_first_package(
-    packet: &[u8],
-    oy: &mut Box<MaybeUninit<ogg_sync_state>>,
-    os: &mut Box<MaybeUninit<ogg_stream_state>>,
-
-    og: &mut Box<MaybeUninit<ogg_page>>,
-    op: &mut Box<MaybeUninit<ogg_packet>>,
-
-    vi: &mut Box<MaybeUninit<vorbis_info>>,
-
-    vc: &mut Box<MaybeUninit<vorbis_comment>>,
-    vd: &mut Box<MaybeUninit<vorbis_dsp_state>>,
-    vb: &mut Box<MaybeUninit<vorbis_block>>,
-) -> Result<()> {
-    unsafe {
-        debug!("Header size: {}", packet.len());
-
-        let buffer_ptr = ogg_sync_buffer(oy.as_mut_ptr(), packet.len().try_into()?).cast::<u8>();
-        let decode_buffer = std::slice::from_raw_parts_mut(buffer_ptr, packet.len());
-        decode_buffer[..packet.len()].copy_from_slice(packet);
-        ogg_sync_wrote(oy.as_mut_ptr(), packet.len().try_into()?);
-
-        /* Get the first page. */
-        if ogg_sync_pageout(oy.as_mut_ptr(), og.as_mut_ptr()) != 1 {
-            return Err(anyhow!("Input does not appear to be an Ogg bitstream."));
-        }
-
-        let serial_no = ogg_page_serialno(og.as_mut_ptr());
-        debug!("Serial number found: {serial_no}");
-        ogg_stream_init(os.as_mut_ptr(), serial_no);
-
-        if ogg_stream_pagein(os.as_mut_ptr(), og.as_mut_ptr()) != 0 {
-            return Err(anyhow!("Error reading first page of Ogg bitstream data."));
-        }
-
-        if ogg_stream_packetout(os.as_mut_ptr(), op.as_mut_ptr()) != 1 {
-            return Err(anyhow!("Error reading initial header packet."));
-        }
-
-        if vorbis_synthesis_idheader(op.as_mut_ptr()) != 1 {
-            return Err(anyhow!("This is not a valid Vorbis first packet."));
-        }
-
-        vorbis_info_init(vi.as_mut_ptr());
-        vorbis_comment_init(vc.as_mut_ptr());
-
-        if vorbis_synthesis_headerin(vi.as_mut_ptr(), vc.as_mut_ptr(), op.as_mut_ptr()) < 0 {
-            return Err(anyhow!(
-                "This Ogg bitstream does not contain Vorbis audio data."
-            ));
-        }
-
-        let mut i = 0;
-
-        while i < 2 {
-            while i < 2 {
-                let mut result = ogg_sync_pageout(oy.as_mut_ptr(), og.as_mut_ptr());
-                if result == 0 {
-                    break;
-                }
-
-                // Don't complain about missing or corrupt data yet. We'll
-                // catch it at the packet output phase
-                if result == 1 {
-                    ogg_stream_pagein(os.as_mut_ptr(), og.as_mut_ptr());
-                    // We can ignore any errors here as they'll also become apparent at packetout
-                    while i < 2 {
-                        result = ogg_stream_packetout(os.as_mut_ptr(), op.as_mut_ptr());
-                        if result == 0 {
-                            break;
-                        }
-                        if result < 0 {
-                            // Uh oh; data at some point was corrupted or missing!
-                            // We can't tolerate that in a header. Die.
-                            return Err(anyhow!("Corrupt secondary header. Exiting."));
-                        }
-                        result = vorbis_synthesis_headerin(
-                            vi.as_mut_ptr(),
-                            vc.as_mut_ptr(),
-                            op.as_mut_ptr(),
-                        );
-                        if result < 0 {
-                            return Err(anyhow!("Corrupt secondary header. Exiting."));
-                        }
-                        i += 1;
-                    }
-                }
-            }
-        }
-
-        {
-            // let ptr = vc.assume_init_ref().user_comments;
-            // ptr.user_comments
-            // while(*ptr){
-            //   error!("%s\n",*ptr);
-            //   ++ptr;
-            // }
-            let vi_ref = vi.assume_init_ref();
-            let vc_ref = vc.assume_init_ref();
-            debug!(
-                "Bitstream is {} channel, {}Hz",
-                vi_ref.channels, vi_ref.rate
-            );
-            let vendor = std::ffi::CStr::from_ptr(vc_ref.vendor);
-            debug!("Encoded by: {}", vendor.to_str()?);
-        }
-
-        vorbis_synthesis_init(vd.as_mut_ptr(), vi.as_mut_ptr());
-        vorbis_block_init(vd.as_mut_ptr(), vb.as_mut_ptr());
-
-        Ok(())
-    }
-}
-
-unsafe fn decode_next_package<P: Producer<Item = f32>>(
-    packet: &[u8],
-    oy: &mut Box<MaybeUninit<ogg_sync_state>>,
-    os: &mut Box<MaybeUninit<ogg_stream_state>>,
-
-    og: &mut Box<MaybeUninit<ogg_page>>,
-    op: &mut Box<MaybeUninit<ogg_packet>>,
-
-    vi: &mut Box<MaybeUninit<vorbis_info>>,
-
-    // vc: &mut Box<MaybeUninit<vorbis_comment>>,
-    vd: &mut Box<MaybeUninit<vorbis_dsp_state>>,
-    vb: &mut Box<MaybeUninit<vorbis_block>>,
-
-    producer: &mut P,
-) -> Result<()> {
-    unsafe {
-        let num_channels = vi.assume_init_ref().channels as usize;
-        let convsize = 4096 / num_channels;
-
-        let buffer_ptr = ogg_sync_buffer(oy.as_mut_ptr(), packet.len().try_into()?).cast::<u8>();
-        let decode_buffer = std::slice::from_raw_parts_mut(buffer_ptr, packet.len());
-        decode_buffer[..packet.len()].copy_from_slice(packet);
-        ogg_sync_wrote(oy.as_mut_ptr(), packet.len().try_into()?);
-
-        loop {
-            let mut result = ogg_sync_pageout(oy.as_mut_ptr(), og.as_mut_ptr());
-            if result == 0 {
-                break;
-            }
-
-            if result < 0 {
-                // Missing or corrupt data at this page position
-                error!("Corrupt or missing data in bitstream; continuing...");
-                break;
-            } else {
-                // Can safely ignore errors at this point
-                ogg_stream_pagein(os.as_mut_ptr(), og.as_mut_ptr());
-
-                loop {
-                    result = ogg_stream_packetout(os.as_mut_ptr(), op.as_mut_ptr());
-
-                    if result == 0 {
-                        break;
-                    }
-
-                    if result < 0 {
-                        // Missing or corrupt data at this page position
-                        // no reason to complain; already complained above
-                    } else {
-                        // We have a packet. Decode it
-                        if vorbis_synthesis(vb.as_mut_ptr(), op.as_mut_ptr()) == 0 {
-                            vorbis_synthesis_blockin(vd.as_mut_ptr(), vb.as_mut_ptr());
-                        }
-
-                        // pcm is a multichannel float vector. In stereo, for example, pcm[0] is left,
-                        // and pcm[1] is right. samples is the size of each channel. Convert the float
-                        // values (-1.0 <= range <= 1.0) to whatever PCM format and write it out
-                        let mut pcm: *mut *mut f32 = std::ptr::null_mut();
-                        loop {
-                            let samples =
-                                vorbis_synthesis_pcmout(vd.as_mut_ptr(), &mut pcm) as usize;
-                            if samples == 0 {
-                                break;
-                            }
-
-                            let bout = std::cmp::min(samples, convsize);
-
-                            // Gether the channel data
-                            let data: Vec<&[f32]> = (0..num_channels)
-                                .map(|channel_num| {
-                                    let channel_data = *pcm.offset(channel_num as isize);
-                                    std::slice::from_raw_parts(channel_data, bout)
-                                })
-                                .collect();
-
-                            // Interlace the audio so cpal can play it
-                            // E.g for 2 channels:  [[L1, L2, L3], [R1, R2, R3]] -> [L0, R0, L1, R1, L2, R2]
-                            let mut interlaced_data = Vec::with_capacity(samples * bout);
-                            for sample_num in 0..bout {
-                                for channel_num in 0..num_channels {
-                                    interlaced_data.push(data[channel_num][sample_num]);
-                                }
-                            }
-
-                            producer.push_slice(&interlaced_data);
-
-                            // Tell libvorbis how many samples we actually consumed
-                            vorbis_synthesis_read(vd.as_mut_ptr(), bout as i32);
-                        }
-                    }
-                }
-            }
-
-            if ogg_page_eos(og.as_mut_ptr()) > 0 {
-                break;
-            };
-        }
-
-        Ok(())
-    }
-}
-
 pub struct ClientController {
     selected_device: Option<Device>,
     latency: (sync::watch::Sender<u32>, sync::watch::Receiver<u32>),
@@ -271,10 +56,7 @@ pub struct ClientController {
 
     cancellation_token: Option<CancellationToken>,
 
-    decode_joinh: Option<std::thread::JoinHandle<Result<()>>>,
-    player_joinh: Option<std::thread::JoinHandle<Result<()>>>,
-    stream_receiver_joinh: Option<tokio::task::JoinHandle<Result<()>>>,
-    server_receiver_joinh: Option<tokio::task::JoinHandle<Result<()>>>,
+    tasks: JoinSet<Result<()>>,
 }
 
 impl ClientController {
@@ -284,10 +66,7 @@ impl ClientController {
             latency: sync::watch::channel(DEFAULT_LATENCY as u32),
             volume: sync::watch::channel(DEFAULT_VOLUME as u32),
             cancellation_token: None,
-            decode_joinh: None,
-            player_joinh: None,
-            stream_receiver_joinh: None,
-            server_receiver_joinh: None,
+            tasks: JoinSet::new(),
         }
     }
 
@@ -330,31 +109,16 @@ impl ClientController {
         self.latency.0.send_replace(latency);
     }
 
-    fn create_decode_task(
-        &self,
+    async fn create_decode_task(
         encrypt_key: [u8; 32],
         mut encoded_rx: sync::mpsc::Receiver<(StreamStatus, Vec<u8>)>,
         mut producer: <HeapRb<f32> as ringbuf::traits::Split>::Prod,
         cancellation_token: CancellationToken,
-    ) -> std::thread::JoinHandle<Result<()>> {
-        std::thread::spawn(move || {
+    ) -> Result<()> {
+        let handle = std::thread::spawn(move || -> Result<()> {
             debug!("Starting decode task");
 
-            let mut oy: Box<MaybeUninit<ogg_sync_state>> = Box::new(MaybeUninit::uninit());
-            let mut os: Box<MaybeUninit<ogg_stream_state>> = Box::new(MaybeUninit::uninit());
-
-            let mut og: Box<MaybeUninit<ogg_page>> = Box::new(MaybeUninit::uninit());
-            let mut op: Box<MaybeUninit<ogg_packet>> = Box::new(MaybeUninit::uninit());
-
-            let mut vi: Box<MaybeUninit<vorbis_info>> = Box::new(MaybeUninit::uninit());
-
-            let mut vc: Box<MaybeUninit<vorbis_comment>> = Box::new(MaybeUninit::uninit());
-            let mut vd: Box<MaybeUninit<vorbis_dsp_state>> = Box::new(MaybeUninit::uninit());
-            let mut vb: Box<MaybeUninit<vorbis_block>> = Box::new(MaybeUninit::uninit());
-
-            unsafe {
-                ogg_sync_init(oy.as_mut_ptr());
-            };
+            let mut decoder = VorbisDecoder::new();
 
             let cancellation_token = cancellation_token;
 
@@ -380,45 +144,37 @@ impl ClientController {
                     .map_err(|e| anyhow!("{e}"))?;
 
                 match stream_status {
-                    StreamStatus::Starting => unsafe {
-                        let _ = decode_first_package(
-                            &data, &mut oy, &mut os, &mut og, &mut op, &mut vi, &mut vc, &mut vd,
-                            &mut vb,
-                        );
-                    },
-                    StreamStatus::Streaming => unsafe {
-                        let _ = decode_next_package(
-                            &data,
-                            &mut oy,
-                            &mut os,
-                            &mut og,
-                            &mut op,
-                            &mut vi,
-                            &mut vd,
-                            &mut vb,
-                            &mut producer,
-                        );
-                    },
+                    StreamStatus::Starting => {
+                        let _ = decoder
+                            .decode_first_package(&data)
+                            .inspect_err(|e| error!("Error while decoding first  {e}"));
+                    }
+                    StreamStatus::Streaming => {
+                        let _ = decoder
+                            .decode_next_package(&data, |stream| {
+                                producer.push_slice(&stream);
+                            })
+                            .inspect_err(|e| error!("Error while decoding {e}"));
+                    }
                     StreamStatus::Stopped => {
                         break 'decode_loop;
                     }
                 };
             }
 
-            unsafe {
-                vorbis_block_clear(vb.as_mut_ptr());
-                vorbis_dsp_clear(vd.as_mut_ptr());
-
-                ogg_stream_clear(os.as_mut_ptr());
-                vorbis_comment_clear(vc.as_mut_ptr());
-                vorbis_info_clear(vi.as_mut_ptr());
-
-                ogg_sync_clear(oy.as_mut_ptr());
-            }
-
             debug!("Stopping decode task");
             Ok(())
+        });
+
+        tokio::task::spawn_blocking(move || {
+            handle
+                .join()
+                .map_err(|e| anyhow!("Error joining decode task {e:?}"))
         })
+        .await
+        .map_err(|e| anyhow!("Error joining tokio decode task {e}"))
+        .flatten()
+        .flatten()
     }
 
     async fn stream_receiver_task(
@@ -486,17 +242,6 @@ impl ClientController {
         Ok::<(), anyhow::Error>(())
     }
 
-    fn create_stream_receiver_task(
-        client_id: String,
-        server_address: SocketAddr,
-        encoded_tx: sync::mpsc::Sender<(StreamStatus, Vec<u8>)>,
-        child_token: CancellationToken,
-    ) -> tokio::task::JoinHandle<Result<()>> {
-        tokio::spawn(async move {
-            Self::stream_receiver_task(client_id, server_address, encoded_tx, child_token).await
-        })
-    }
-
     async fn server_receiver_task(
         mut tcp_stream: TcpStream,
         cancellation_token: CancellationToken,
@@ -558,25 +303,14 @@ impl ClientController {
         Ok(())
     }
 
-    fn create_server_receiver_task(
-        tcp_stream: TcpStream,
-        cancellation_token: CancellationToken,
-    ) -> tokio::task::JoinHandle<Result<()>> {
-        tokio::spawn(
-            async move { Self::server_receiver_task(tcp_stream, cancellation_token).await },
-        )
-    }
-
-    fn create_playback_task(
-        &self,
+    async fn create_playback_task(
+        volume: sync::watch::Receiver<u32>,
         config: SupportedStreamConfig,
         device: Device,
         mut consumer: <HeapRb<f32> as ringbuf::traits::Split>::Cons,
         child_token: CancellationToken,
-    ) -> std::thread::JoinHandle<Result<()>> {
-        let volume = self.volume.1.clone();
-
-        std::thread::spawn(move || {
+    ) -> Result<()> {
+        let handle = std::thread::spawn(move || -> Result<()> {
             debug!("Starting playback task");
 
             let err_fn = move |err| {
@@ -612,7 +346,17 @@ impl ClientController {
             debug!("Stopping playback task");
 
             Ok(())
+        });
+
+        tokio::task::spawn_blocking(move || {
+            handle
+                .join()
+                .map_err(|e| anyhow!("Error joining playback task {e:?}"))
         })
+        .await
+        .map_err(|e| anyhow!("Error joining tokio playback task {e}"))
+        .flatten()
+        .flatten()
     }
 
     pub async fn start(&mut self, server_address: SocketAddr, password: String) -> Result<()> {
@@ -724,30 +468,29 @@ impl ClientController {
                 .map_err(|e| anyhow!("Could not fill buffer: {e}"))?;
         }
 
-        self.decode_joinh.replace(self.create_decode_task(
+        self.tasks.spawn(Self::create_decode_task(
             encrypt_key,
             encoded_rx,
             producer,
             cancellation_token.child_token(),
         ));
-        self.player_joinh.replace(self.create_playback_task(
+        self.tasks.spawn(Self::create_playback_task(
+            self.volume.1.clone(),
             config,
             device.clone(),
             consumer,
             cancellation_token.child_token(),
         ));
-        self.stream_receiver_joinh
-            .replace(Self::create_stream_receiver_task(
-                client_id.clone(),
-                server_address,
-                encoded_tx,
-                cancellation_token.child_token(),
-            ));
-        self.server_receiver_joinh
-            .replace(Self::create_server_receiver_task(
-                tcp_stream,
-                cancellation_token.clone(),
-            ));
+        self.tasks.spawn(Self::stream_receiver_task(
+            client_id.clone(),
+            server_address,
+            encoded_tx,
+            cancellation_token.child_token(),
+        ));
+        self.tasks.spawn(Self::server_receiver_task(
+            tcp_stream,
+            cancellation_token.clone(),
+        ));
 
         self.cancellation_token.replace(cancellation_token);
 
@@ -755,25 +498,11 @@ impl ClientController {
     }
 
     pub async fn wait(&mut self) -> Result<()> {
-        if let Some(joinh) = self.stream_receiver_joinh.take() {
-            if let Err(e) = joinh.await {
-                error!("{e:?}");
-            };
-        }
-        if let Some(joinh) = self.server_receiver_joinh.take() {
-            if let Err(e) = joinh.await {
-                error!("{e:?}");
-            };
-        }
-        if let Some(joinh) = self.decode_joinh.take() {
-            if let Err(e) = joinh.join() {
-                error!("{e:?}");
-            };
-        }
-        if let Some(joinh) = self.player_joinh.take() {
-            if let Err(e) = joinh.join() {
-                error!("{e:?}");
-            };
+        while let Some(result) = self.tasks.join_next().await {
+            let internal_result = result.map_err(|e| anyhow!("Error joining {e}")).flatten();
+            if let Err(e) = internal_result {
+                error!("{e}");
+            }
         }
         Ok(())
     }
@@ -789,5 +518,13 @@ impl ClientController {
 
     pub fn is_running(&self) -> bool {
         return self.cancellation_token.is_some();
+    }
+}
+
+impl Drop for ClientController {
+    fn drop(&mut self) {
+        if let Some(cancellation_token) = self.cancellation_token.take() {
+            cancellation_token.cancel();
+        }
     }
 }

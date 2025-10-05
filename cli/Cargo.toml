@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [lib]
-name = "oabs_cli"
+name = "oabs_common"
 path = "src/common/lib.rs"
 
 [[bin]]
@@ -26,7 +26,9 @@ rand = "0.8"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 strum = { version = "0.26", features = ["derive"] }
+thiserror = "2.0"
 time = { version = "0.3", features = ["local-offset"] }
 tokio = { version = "1.37", features = ["full"] }
+tokio-util = "0.7"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "time"] }
